@@ -1,0 +1,144 @@
+1. modules/file_manager.py — ensure_voice_sample_compatibility
+What changed: Removed the early-return for already-compatible files. Always writes a _ttsready.wav copy to the output directory.
+Old behavior:
+def ensure_voice_sample_compatibility(input_path, output_dir=None):
+    input_path = str(input_path)
+    ext = os.path.splitext(input_path)[1].lower()
+    basename = os.path.splitext(os.path.basename(input_path))[0]
+    output_dir = output_dir or os.path.dirname(input_path)
+    output_path = os.path.join(output_dir, basename + "_ttsready.wav")
+    try:
+        info = sf.info(input_path)
+        if (ext == '.wav' and info.samplerate == 24000 and info.channels == 1):
+            return input_path  # <-- returned early, no copy made
+    except Exception:
+        pass
+    cmd = ["ffmpeg", "-y", "-i", input_path, "-ar", "24000", "-ac", "1", output_path]
+    subprocess.run(cmd, ...)
+    return output_path
+New behavior:
+def ensure_voice_sample_compatibility(input_path, output_dir=None):
+    input_path = Path(input_path)
+    output_dir = Path(output_dir) if output_dir else input_path.parent
+    basename = input_path.stem
+    output_name = basename if basename.endswith("_ttsready") else f"{basename}_ttsready"
+    output_path = output_dir / f"{output_name}.wav"
+    if input_path.resolve() == output_path.resolve():
+        return str(output_path)  # only skips if src == dest
+    output_dir.mkdir(parents=True, exist_ok=True)
+    cmd = ["ffmpeg", "-y", "-i", str(input_path), "-ar", "24000", "-ac", "1", str(output_path)]
+    subprocess.run(cmd, ...)
+    return str(output_path)
+Also changed list_voice_samples:
+# Old: only *.wav
+return sorted(VOICE_SAMPLES_DIR.glob("*.wav"), key=lambda x: x.stem.lower())
+# New: include mp3, flac, m4a, ogg too
+return sorted(
+    (p for p in VOICE_SAMPLES_DIR.iterdir() if p.suffix.lower() in {".wav", ".mp3", ".flac", ".m4a", ".ogg"}),
+    key=lambda p: p.stem.lower(),
+)
+2. modules/voice_detector.py — get_likely_voices_for_book
+What changed: Replaced 3-method pipeline (JSON + run.log + filename patterns) with 3-source pipeline (JSON → TTS copy → Voice_Samples). Removed get_voice_from_log call path. Added get_audio_prompt_path_from_json and get_voices_from_tts_dir.
+Old pipeline:
+Method 1: JSON voice_used → resolve via find_voice_file_by_name() or find_voice_in_tts_dir()
+Method 2: run.log "Voice:" line → resolve same way
+Method 3: Book root *.wav/*.m4b [VoiceName] → resolve same way
+New pipeline:
+# JSON voice_used → prefers TTS copy first, seeds from audio_prompt_path if missing, falls back to Voice_Samples
+if chunks_json_path:
+    voice_from_json = get_voice_from_json(chunks_json_path)
+    if voice_from_json:
+        voice_path = find_voice_in_tts_dir(voice_from_json, book_name)
+        if not voice_path:
+            stored_prompt_path = get_audio_prompt_path_from_json(chunks_json_path)
+            source_path = stored_prompt_path if stored_prompt_path and stored_prompt_path.exists() \
+                         else find_voice_file_by_name(voice_from_json)
+            if source_path:
+                tts_dir = Path(AUDIOBOOK_ROOT) / book_name / "TTS"
+                voice_path = Path(ensure_voice_sample_compatibility(source_path, tts_dir))
+        if voice_path:
+            likely_voices.append((voice_from_json, voice_path, "json_metadata"))
+
+# TTS scan — every _ttsready.wav in book TTS folder
+for voice_name, voice_path in get_voices_from_tts_dir(book_name):
+    if not any(v[0].casefold() == voice_name.casefold() for v in likely_voices):
+        likely_voices.append((voice_name, voice_path, "tts_directory"))
+
+# Voice_Samples scan — every audio file
+for voice_path in list_voice_samples():
+    voice_name = voice_path.stem.removesuffix("_ttsready")
+    if not any(v[0].casefold() == voice_name.casefold() for v in likely_voices):
+        likely_voices.append((voice_name, voice_path, "voice_samples"))
+New helper functions:
+def get_audio_prompt_path_from_json(json_path):
+    """Return saved original prompt path from JSON metadata when it still exists."""
+    with open(json_path, 'r') as f:
+        data = json.load(f)
+    if isinstance(data, dict):
+        audio_prompt_path = data.get('audio_prompt_path')
+    elif isinstance(data, list) and data and isinstance(data[0], dict):
+        audio_prompt_path = data[0].get('audio_prompt_path')
+    else:
+        audio_prompt_path = None
+    return Path(audio_prompt_path) if audio_prompt_path else None
+
+def get_voices_from_tts_dir(book_name):
+    """Return (voice_name, path) for every WAV in Audiobook/<book>/TTS/."""
+    tts_dir = Path(AUDIOBOOK_ROOT) / book_name / "TTS"
+    if not tts_dir.exists():
+        return []
+    return [
+        (f.stem.removesuffix("_ttsready"), f)
+        for f in sorted(tts_dir.glob("*.wav"), key=lambda p: p.stem.casefold())
+    ]
+Import change:
+# Old:
+from modules.file_manager import list_voice_samples
+# New:
+from modules.file_manager import ensure_voice_sample_compatibility, list_voice_samples
+3. chatterbox_gui.py — detect_and_update_voice_info
+What changed: Auto-selects the JSON metadata candidate instead of forcing manual pick.
+Old code (inside detect_and_update_voice_info):
+self.repair_voice_combo.clear()
+self.repair_voice_combo.addItem("-- Please Select Voice --", None)
+if likely_voices:
+    for voice_name, voice_path, detection_method in likely_voices:
+        display_text = f"{voice_name} ({detection_method})"
+        self.repair_voice_combo.addItem(display_text, (voice_name, voice_path, detection_method))
+    self.current_repair_voice_name = None       # always cleared
+    self.current_repair_voice_path = None        # always cleared
+    info_text = f"✅ Found {len(likely_voices)} candidate(s). Please select voice..."
+New code:
+self.repair_voice_combo.clear()
+self.repair_voice_combo.addItem("-- Please Select Voice --", None)
+if likely_voices:
+    selected_voice = None
+    for combo_index, (voice_name, voice_path, detection_method) in enumerate(likely_voices, start=1):
+        display_text = f"{voice_name} ({detection_method})"
+        self.repair_voice_combo.addItem(display_text, (voice_name, voice_path, detection_method))
+        if detection_method == "json_metadata":
+            selected_voice = (combo_index, voice_name, voice_path)
+
+    if selected_voice:
+        combo_index, voice_name, voice_path = selected_voice
+        self.repair_voice_combo.setCurrentIndex(combo_index)
+        self.current_repair_voice_name = voice_name
+        self.current_repair_voice_path = voice_path
+        info_text = f"✅ Auto-selected {voice_name} from JSON metadata."
+    else:
+        self.current_repair_voice_name = None
+        self.current_repair_voice_path = None
+        info_text = f"✅ Found {len(likely_voices)} candidate(s). Please select voice..."
+4. wrapper/chunk_synthesizer.py — synthesize_chunk
+What changed: Pass output_dir to ensure_voice_sample_compatibility so the TTS-ready copy lands in the book's TTS folder, not in-place.
+# Old:
+compatible_voice = ensure_voice_sample_compatibility(voice_path)
+# New:
+compatible_voice = ensure_voice_sample_compatibility(voice_path, output_dir=Path(audio_dir).parent)
+(This ensures that when a user manually picks a Voice_Samples file via the repair dropdown, a _ttsready.wav copy gets written into <book>/TTS/ for future use.)
+Summary for applying to other projects
+The changes are fully self-contained in these four files but depend on these conventions:
+1. config.config.AUDIOBOOK_ROOT and VOICE_SAMPLES_DIR must exist
+2. modules.file_manager.list_voice_samples() and ensure_voice_sample_compatibility() must exist
+3. modules.voice_detector.get_voice_from_json() must exist (returns voice_used string from JSON)
+4. JSON chunks files must have voice_used (string) and optionally audio_prompt_path (original file path) in metadata
