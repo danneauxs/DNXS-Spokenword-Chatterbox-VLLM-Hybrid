@@ -13,11 +13,18 @@ import time
 import logging
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor
-from difflib import SequenceMatcher
+from concurrent.futures.process import BrokenProcessPool
+
+_ASR_DIR = Path(__file__).resolve().parent
+if str(_ASR_DIR) not in sys.path:
+    sys.path.insert(0, str(_ASR_DIR))
+from spoken_compare import compare_spoken, strip_chatterbox_pause_tags
 
 # Globals for persistent model (loaded once per worker)
 _model = None
 _device = None
+_backend = "faster_whisper"
+
 
 def _load_whisper_model(model_size="base", device="cpu"):
     """
@@ -59,15 +66,85 @@ def _load_whisper_model(model_size="base", device="cpu"):
         raise
 
 
-def _initialize_worker(model_size="base", device="cpu"):
-    """Load Whisper model once per worker process."""
-    global _model, _device
+def _require_backend_installed(backend: str) -> None:
+    """Exit-quality check so a missing optional engine cannot start a dead pool.
+
+    Args:
+        backend: Canonical or alias backend name.
+
+    Raises:
+        RuntimeError: Required package is not importable in this venv.
+    """
+    kind = str(backend or "faster_whisper").strip().lower().replace("-", "_")
+    if kind in {"parakeet", "parakeet_tdt", "nemo", "nemo_parakeet"}:
+        from parakeet_backend import parakeet_is_available
+
+        if not parakeet_is_available():
+            raise RuntimeError(
+                "NeMo ASR is not installed. Install optional nemo-toolkit[asr] "
+                "in this venv to use Parakeet Stage 1, or pick faster-whisper."
+            )
+        return
+    if kind in {"whisper_cpp", "whispercpp", "cpp"}:
+        try:
+            import pywhispercpp  # noqa: F401
+        except ImportError as exc:
+            raise RuntimeError(
+                "pywhispercpp is not installed. pip install pywhispercpp "
+                "(GPU: ASR/install_pywhispercpp_cuda.sh) or pick faster-whisper."
+            ) from exc
+
+
+def _load_asr_engine(model_size="base", device="cpu", backend="faster_whisper"):
+    """Load the selected Stage transcriber into this worker.
+
+    Args:
+        model_size: Whisper size or Parakeet id.
+        device: cpu or cuda.
+        backend: faster_whisper, whisper_cpp, or parakeet.
+
+    Returns:
+        (model, device_label)
+    """
+    kind = str(backend or "faster_whisper").strip().lower().replace("-", "_")
+    if kind in {"whisper_cpp", "whispercpp", "cpp"}:
+        from whisper_cpp_backend import load_whisper_cpp_model
+
+        model, loaded = load_whisper_cpp_model(
+            model_size, force_device=device, n_threads=2
+        )
+        if model is None and str(device).lower() in {"cuda", "gpu"}:
+            logging.warning("whisper.cpp GPU load failed; retrying on CPU")
+            model, loaded = load_whisper_cpp_model(
+                model_size, force_device="cpu", n_threads=2
+            )
+        if model is None:
+            raise RuntimeError("whisper.cpp failed to load")
+        return model, loaded or device
+    if kind in {"parakeet", "parakeet_tdt", "nemo", "nemo_parakeet"}:
+        from parakeet_backend import ParakeetAsrModel
+
+        model = ParakeetAsrModel(model_name=model_size, device=device)
+        return model, model.device
+    return _load_whisper_model(model_size, device)
+
+
+def _initialize_worker(model_size="base", device="cpu", backend="faster_whisper"):
+    """Load the chosen ASR engine once per worker process."""
+    global _model, _device, _backend
     if _model is not None:
         return
 
     try:
-        _model, _device = _load_whisper_model(model_size, device)
-        logging.info(f"Worker {os.getpid()} loaded ASR model ({model_size}) on {_device}")
+        _backend = backend
+        _model, _device = _load_asr_engine(model_size, device, backend)
+        logging.info(
+            "Worker %s loaded %s (%s) on %s",
+            os.getpid(),
+            backend,
+            model_size,
+            _device,
+        )
     except Exception as e:
         logging.error(f"Worker {os.getpid()} failed to load ASR model: {e}")
         raise
@@ -80,7 +157,11 @@ def _normalize_text(text: str) -> str:
 
 
 def _validate_chunk(task_data: dict) -> dict:
-    """Validate a single chunk (runs in worker with persistent model)."""
+    """Validate one chunk and return the worker's resolved backend/device.
+
+    The returned device is set after model load, not copied from the GUI request,
+    so a CPU fallback is visible to the parent process and persisted reports.
+    """
     global _model
 
     if _model is None:
@@ -103,7 +184,9 @@ def _validate_chunk(task_data: dict) -> dict:
             'passed': False,
             'score': 0.0,
             'error': f'File not found: {wav_path}',
-            'asr_text': ''
+            'asr_text': '',
+            'backend': _backend,
+            'device': _device,
         }
 
     try:
@@ -117,17 +200,30 @@ def _validate_chunk(task_data: dict) -> dict:
         )
         asr_text = " ".join([seg.text for seg in segments]).strip()
 
-        # Compute similarity
-        expected_norm = _normalize_text(expected_text)
-        asr_norm = _normalize_text(asr_text)
-        score = SequenceMatcher(None, expected_norm, asr_norm).ratio()
-
+        compared = compare_spoken(
+            strip_chatterbox_pause_tags(expected_text),
+            asr_text,
+            threshold=threshold,
+        )
         return {
             'chunk_id': chunk_id,
-            'passed': score >= threshold,
-            'score': score,
+            'passed': compared['passed'],
+            'score': compared['score'],
+            'classification': compared['classification'],
+            'failure_type': compared.get('failure_type', ''),
             'asr_text': asr_text,
             'expected_text': expected_text,
+            'ref_normalized': compared.get('ref_normalized', ''),
+            'hyp_normalized': compared.get('hyp_normalized', ''),
+            'extra_content_words': compared.get('extra_content_words', 0),
+            'missing_words': compared.get('missing_words', []),
+            'extra_words': compared.get('extra_words', []),
+            'coverage_score': compared.get('coverage_score'),
+            'phonetic_score': compared.get('phonetic_score'),
+            'accepted_equivalences': compared.get('accepted_equivalences', []),
+            'explanation': compared.get('explanation', ''),
+            'backend': _backend,
+            'device': _device,
             'error': None
         }
     except Exception as e:
@@ -136,20 +232,49 @@ def _validate_chunk(task_data: dict) -> dict:
             'passed': False,
             'score': 0.0,
             'error': str(e),
-            'asr_text': ''
+            'asr_text': '',
+            'backend': _backend,
+            'device': _device,
         }
 
 
 def run_daemon(
     queue_dir: Path, results_dir: Path, num_workers: int = 4,
-    model_size: str = "base", device: str = "cpu",
+    model_size: str = "base", device: str = "cpu", backend: str = "faster_whisper",
 ):
-    """Main daemon loop: watch queue, process tasks, write results."""
+    """Watch the task queue, run persistent ASR workers, and write result JSON.
+
+    A requested CUDA device can resolve to CPU when pywhispercpp lacks its
+    GGML CUDA bundle.  Match parent worker sizing so that fallback case keeps
+    configured CPU parallelism instead of retaining CUDA's conservative cap.
+    """
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s'
     )
-    logging.info(f"ASR daemon starting with {num_workers} workers (model: {model_size}, device: {device})")
+    kind = str(backend or "faster_whisper").strip().lower().replace("-", "_")
+    workers = max(1, int(num_workers or 1))
+    if kind in {"parakeet", "parakeet_tdt", "nemo", "nemo_parakeet"}:
+        workers = 1
+    elif kind in {"whisper_cpp", "whispercpp", "cpp"} and device == "cuda":
+        try:
+            from whisper_cpp_backend import whisper_cpp_cuda_bundle_available
+            import torch
+
+            if whisper_cpp_cuda_bundle_available() and torch.cuda.is_available():
+                workers = min(workers, 2)
+        except (ImportError, OSError, RuntimeError):
+            # Keep CPU parallelism when CUDA capability probing itself is unavailable.
+            pass
+    num_workers = workers
+    logging.info(
+        "ASR daemon starting with %s workers (backend: %s, model: %s, device: %s)",
+        num_workers,
+        backend,
+        model_size,
+        device,
+    )
+    _require_backend_installed(backend)
 
     queue_dir.mkdir(exist_ok=True)
     results_dir.mkdir(exist_ok=True)
@@ -159,14 +284,21 @@ def run_daemon(
     pid_file.write_text(f"{os.getpid()}\n{time.time()}")
 
     executor = ProcessPoolExecutor(
-        max_workers=num_workers, initializer=_initialize_worker, initargs=(model_size, device)
+        max_workers=num_workers,
+        initializer=_initialize_worker,
+        initargs=(model_size, device, backend),
     )
     pending_futures = {}  # future -> chunk_id
+    pool_dead = False
 
     try:
         while True:
             # Update heartbeat
             pid_file.write_text(f"{os.getpid()}\n{time.time()}")
+
+            if pool_dead:
+                logging.error("ASR worker pool is dead; exiting so the GUI does not wait")
+                break
 
             # Submit new tasks
             for task_file in sorted(queue_dir.glob("*.task.json")):
@@ -181,7 +313,16 @@ def run_daemon(
                     # Remove task file
                     task_file.unlink()
                     logging.info(f"Queued {chunk_id}")
+                except BrokenProcessPool as e:
+                    pool_dead = True
+                    logging.error("ASR worker pool died: %s", e)
+                    break
                 except Exception as e:
+                    err = str(e)
+                    if "process pool is not usable" in err:
+                        pool_dead = True
+                        logging.error("ASR worker pool died: %s", e)
+                        break
                     logging.error(f"Failed to process task {task_file}: {e}")
 
             # Collect completed results
@@ -219,6 +360,19 @@ if __name__ == "__main__":
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--model-size", type=str, default="base")
     parser.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda"])
+    parser.add_argument(
+        "--backend",
+        type=str,
+        default="faster_whisper",
+        help="faster_whisper, whisper_cpp, or parakeet",
+    )
     args = parser.parse_args()
 
-    run_daemon(args.queue_dir, args.results_dir, args.workers, args.model_size, args.device)
+    run_daemon(
+        args.queue_dir,
+        args.results_dir,
+        args.workers,
+        args.model_size,
+        args.device,
+        args.backend,
+    )

@@ -9,6 +9,8 @@ Integrates with Chatterbox vLLM pipeline.
 import re
 from typing import List, Tuple
 
+from modules.punctuation_pauses import split_t3_sentences
+
 try:
     import torch
     TORCH_AVAILABLE = True
@@ -24,101 +26,177 @@ except ImportError:
     NUMPY_AVAILABLE = False
 
 
-def parse_pause_tags(text: str) -> Tuple[List[str], List[float]]:
-    """
-    Parse text with [pause:Xms] tags and extract segments with pause durations.
+def is_speech_text_segment(text: str) -> bool:
+    """Return True when a pause-split piece has spoken alphanumeric content.
+
+    Quote-only or punctuation-only fragments as standalone T3 prompts cause
+    context-free hallucinations (same failure Pocket documented).
 
     Args:
-        text: Input text containing [pause:Xms] tags
+        text: One text segment after pause-tag splitting.
 
     Returns:
-        tuple: (segments, pause_durations)
-            segments: List of text segments between pauses
-            pause_durations: List of pause durations in seconds between segments
-
-    Example:
-        "Hello [pause:150ms] world" → (["Hello", "world"], [0.15])
+        True if T3 should generate this piece.
     """
-    # Pattern to match [pause:Xms] - no capturing groups for split
-    split_pattern = r'\[pause:\d+ms\]'
-    pause_pattern = r'\[pause:(\d+)ms\]'
+    return any(ch.isalnum() for ch in str(text or ""))
 
-    # Split text at pause tags, keeping the tags
-    parts = re.split(f'({split_pattern})', text)
 
-    segments = []
-    pause_durations = []
+def _is_short_orphan(text: str, min_words: int = 3) -> bool:
+    """Return True for a mid-clause leftover too small to be its own T3 prompt.
 
-    current_segment = ""
-    i = 0
-    while i < len(parts):
-        part = parts[i]
+    Complete micro-sentences (Yes. / No!) are kept. Bare tails without sentence
+    punctuation are merged back so T3 is not asked to start on "he said".
 
-        if re.match(pause_pattern, part):
-            # This is a pause tag - extract duration
-            if current_segment.strip():
-                segments.append(current_segment.strip())
+    Args:
+        text: Speech segment.
+        min_words: Word-count floor; at or above this, keep as its own prompt.
 
-            match = re.match(r'\[pause:(\d+)ms\]', part)
-            if match:
-                duration_ms = int(match.group(1))
-                duration_sec = duration_ms / 1000.0
-            else:
-                duration_sec = 0.0  # fallback
-            pause_durations.append(duration_sec)
-            current_segment = ""
-        else:
-            # This is text content
-            current_segment += part
+    Returns:
+        True when this fragment should be glued onto the previous segment.
+    """
+    stripped = str(text or "").strip()
+    if not stripped or not is_speech_text_segment(stripped):
+        return True
+    words = stripped.split()
+    if len(words) >= min_words:
+        return False
+    return stripped[-1] not in ".!?"
 
-        i += 1
 
-    # Add the final segment if it exists
-    if current_segment.strip():
-        segments.append(current_segment.strip())
+def parse_pause_tags(text: str) -> Tuple[List[str], List[float]]:
+    """Parse [pause:Xms] tags into T3 text segments and silence durations.
 
-    # Defensive: If we have trailing pauses (more pauses than segments-1), trim them
-    # This handles old/bad data that ended with pause tags
-    expected_pause_count = len(segments) - 1
-    if len(pause_durations) > expected_pause_count:
-        # Trim trailing pauses
-        pause_durations = pause_durations[:expected_pause_count]
+    Zero-ms tags do not split. Mute/punctuation-only pieces are dropped.
+    Short orphans without sentence-end punctuation merge into the previous
+    segment so T3 never sees a two-word clause as a new utterance. Each
+    remaining piece is then split on real sentence ends so vLLM can stop
+    after one sentence without dropping the next. A pause-only chunk returns
+    no speech segments and one silence duration so the decoder can render it
+    as silence instead of speech.
 
-    return segments, pause_durations
+    Args:
+        text: Input text containing [pause:Xms] tags.
+
+    Returns:
+        (segments, pause_durations) with one fewer pause than segments.
+    """
+    split_pattern = r"\[pause:\d+ms\]"
+    pause_pattern = r"\[pause:(\d+)ms\]"
+    parts = re.split(f"({split_pattern})", text or "")
+
+    raw_segments: List[str] = []
+    raw_pauses: List[float] = []
+    current = ""
+    pending_pause: float = 0.0
+
+    def _flush_current() -> None:
+        """Commit buffered speech and attach any pending pause to it."""
+        nonlocal current, pending_pause
+        piece = current.strip()
+        current = ""
+        if not piece:
+            return
+        raw_segments.append(piece)
+        if pending_pause > 0:
+            raw_pauses.append(pending_pause)
+            pending_pause = 0.0
+
+    for part in parts:
+        match = re.match(pause_pattern, part)
+        if match:
+            duration_sec = int(match.group(1)) / 1000.0
+            if duration_sec <= 0:
+                # 0 ms: keep accumulating into the same T3 prompt.
+                continue
+            _flush_current()
+            pending_pause += duration_sec
+            continue
+        current += part
+    _flush_current()
+    if pending_pause > 0 and raw_segments:
+        raw_pauses.append(pending_pause)
+        pending_pause = 0.0
+
+    segments: List[str] = []
+    pauses: List[float] = []
+    for i, seg in enumerate(raw_segments):
+        pause_before = raw_pauses[i - 1] if i > 0 and i - 1 < len(raw_pauses) else None
+        if not is_speech_text_segment(seg):
+            continue
+        if segments and _is_short_orphan(seg):
+            segments[-1] = f"{segments[-1]} {seg}".strip()
+            continue
+        if segments and pause_before is not None:
+            pauses.append(pause_before)
+        segments.append(seg)
+
+    if not segments:
+        if pending_pause > 0:
+            return [], [pending_pause]
+        if raw_pauses:
+            return [], raw_pauses
+        fallback = re.sub(split_pattern, " ", text or "").strip()
+        return ([fallback] if fallback else [text or ""]), []
+
+    return _expand_segments_to_sentences(segments, pauses)
+
+
+def _expand_segments_to_sentences(
+    segments: List[str], pauses: List[float]
+) -> Tuple[List[str], List[float]]:
+    """Turn each pause-tag segment into one T3 prompt per sentence.
+
+    Extra sentences join with 0 ms so S3Gen still concatenates them inside the
+    same chunk. Original pause-tag gaps stay between the pieces they split.
+
+    Args:
+        segments: Speech pieces after pause-tag parsing.
+        pauses: Seconds of silence between those pieces.
+
+    Returns:
+        (sentence_prompts, pauses) with one fewer pause than prompts.
+    """
+    new_segments: List[str] = []
+    new_pauses: List[float] = []
+    inter_segment_pauses = pauses[: max(0, len(segments) - 1)]
+    trailing_pauses = pauses[len(segments) - 1 :] if len(pauses) >= len(segments) else []
+    for index, segment in enumerate(segments):
+        parts = split_t3_sentences(segment) or [segment]
+        for part_index, part in enumerate(parts):
+            if new_segments:
+                if part_index == 0 and index > 0 and index - 1 < len(inter_segment_pauses):
+                    new_pauses.append(inter_segment_pauses[index - 1])
+                else:
+                    new_pauses.append(0.0)
+            new_segments.append(part)
+    if not new_segments:
+        return segments, pauses
+    if trailing_pauses:
+        new_pauses.extend(trailing_pauses)
+    return new_segments, new_pauses
 
 
 def convert_inline_markers_to_pause_tags(text: str) -> str:
     """
-    Convert shorthand inline pause markers ("~1", "~2") into [pause:Xms] tags.
+    Convert numeric inline pause markers such as "~500" into [pause:Xms] tags.
 
-    Lets users type "~1"/"~2" directly in source text as a manual pause shorthand;
-    gated by config.ENABLE_INLINE_PAUSES, durations from config.INLINE_PAUSE_1_MS /
-    INLINE_PAUSE_2_MS. Ported from the equivalent marker syntax in the sibling Turbo
-    project (src/chatterbox/tts.py), adapted to this project's [pause:Xms] (integer
-    milliseconds) tag format rather than that project's [pause:Xs] seconds format.
+    Every numeric marker converts directly from milliseconds, independent of GUI
+    checkbox state.
 
     Args:
-        text: Input text potentially containing ~1/~2 markers.
+        text: Input text potentially containing numeric ~N markers.
 
     Returns:
-        Text with ~1/~2 replaced by [pause:Xms] tags; unchanged if disabled.
+        Text with supported markers replaced by [pause:Xms] tags.
     """
-    from config.config import ENABLE_INLINE_PAUSES, INLINE_PAUSE_1_MS, INLINE_PAUSE_2_MS
-
-    if not ENABLE_INLINE_PAUSES:
-        return text
-
-    inline_map = {
-        "~1": max(0, int(INLINE_PAUSE_1_MS)),
-        "~2": max(0, int(INLINE_PAUSE_2_MS)),
-    }
-
     def _repl(m):
-        """Replaces a matched ~1/~2 marker with its configured [pause:Xms] tag."""
-        ms = inline_map.get(m.group(0))
-        return f"[pause:{ms}ms]" if ms is not None else m.group(0)
+        """Replace one numeric marker with its millisecond pause tag."""
+        ms = int(m.group(1))
+        if ms <= 0:
+            return ""
+        return f"[pause:{ms}ms]"
 
-    return re.sub(r"~[12]", _repl, text)
+    return re.sub(r"~(\d+)", _repl, text)
 
 
 def create_silence_tensor(duration_sec: float, sample_rate: int = 24000, device=None):

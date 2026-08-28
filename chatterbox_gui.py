@@ -7,7 +7,10 @@ A proper GUI wrapper for the main_launcher.py functionality
 import sys
 import os
 import subprocess
+import json
+from datetime import datetime
 from pathlib import Path
+from uuid import uuid4
 from PyQt5.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -40,7 +43,7 @@ from PyQt5.QtWidgets import (
     QRadioButton,
     QMenu,
 )
-from PyQt5.QtCore import QThread, pyqtSignal, QTimer, Qt, QSettings, QMetaObject, Q_ARG
+from PyQt5.QtCore import QThread, pyqtSignal, QTimer, Qt, QSettings, QMetaObject, Q_ARG, QSize
 from PyQt5.QtGui import QFont, QPixmap
 
 # Import the existing modules
@@ -63,6 +66,13 @@ from modules.resume_handler import find_incomplete_books
 from modules.tts_engine import generate_enriched_chunks
 from modules.tts_engine import process_book_folder
 from modules.token_to_audio import TokenToAudioConverter
+from modules.batch_queue import (
+    append_batch_report,
+    load_queue,
+    parse_asr_summary,
+    parse_timestamped_run_log,
+    save_queue,
+)
 from config import config as _cfg
 
 try:
@@ -113,6 +123,74 @@ class NoScrollDoubleSpinBox(QDoubleSpinBox):
         event.ignore()
 
 
+class FillColumnLogo(QLabel):
+    """Logo drawn at the width of its column, keeping the source aspect ratio.
+
+    Horizontal policy is Expanding so the column can take leftover width.
+    Vertical policy is Ignored so this widget cannot stretch the checkbox
+    row or insert gaps above/below the spinners. Height is only the
+    pixmap's; extra cell space (from a row-span) stays empty below.
+    """
+
+    def __init__(self, pixmap, padding=8, parent=None):
+        """Store the source artwork and enable width-only scaling.
+
+        Args:
+            pixmap (QPixmap): Unscaled source artwork.
+            padding (int): Empty pixels on the left and right of the image.
+            parent (QWidget, optional): Qt parent widget.
+        """
+        super().__init__(parent)
+        self._src = QPixmap(pixmap)
+        self._padding = max(0, int(padding))
+        self._last_box = None
+        self.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Ignored)
+        self.setMinimumWidth(120)
+        if not self._src.isNull():
+            self._apply_box(220, 100)
+
+    def hasHeightForWidth(self):
+        """Do not report height-for-width; that is what padded the spinner row."""
+        return False
+
+    def sizeHint(self):
+        """Provide a modest default; leftover width comes from the grid stretch."""
+        return QSize(220, 80)
+
+    def minimumSizeHint(self):
+        """Keep a usable floor so the logo cannot collapse to a stamp."""
+        return QSize(120, 40)
+
+    def resizeEvent(self, event):
+        """Scale the pixmap to the current column cell, keeping aspect ratio."""
+        super().resizeEvent(event)
+        self._apply_box(self.width(), self.height())
+
+    def _apply_box(self, width, height):
+        """Fit the source pixmap inside the column cell, keeping aspect ratio.
+
+        The cell is leftover width by (quality + presets) height. The image
+        will not draw past the TTS Presets row.
+
+        Args:
+            width (int): Full width of this widget in pixels.
+            height (int): Full height of this widget in pixels.
+        """
+        if self._src.isNull() or width <= 0 or height <= 0:
+            return
+        inner_w = max(1, int(width) - (2 * self._padding))
+        inner_h = max(1, int(height) - (2 * self._padding))
+        box = (inner_w, inner_h)
+        if box == self._last_box:
+            return
+        self._last_box = box
+        scaled = self._src.scaled(
+            inner_w, inner_h, Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+        self.setPixmap(scaled)
+
+
 class StructuredStatusPanel(QGroupBox):
     """Structured status panel widget for TTS operations"""
 
@@ -147,11 +225,14 @@ class StructuredStatusPanel(QGroupBox):
         # Audio controls moved to main button area next to Regenerate M4B
 
         self.remaining_label = QLabel("--:--:--")
-        self.realtime_label = QLabel("--")
+        self.realtime_raw_label = QLabel("--")
+        self.realtime_total_label = QLabel("--")
         self.audio_duration_label = QLabel("00:00:00")
         self.current_chunk_label = QLabel("--")
         self.phase1_elapsed_label = QLabel("0:00:00")
         self.phase2_elapsed_label = QLabel("0:00:00")
+        self.asr_stage1_elapsed_label = QLabel("0:00:00")
+        self.asr_stage2_elapsed_label = QLabel("0:00:00")
         self.total_elapsed_label = QLabel("0:00:00")
 
         # Add fields to layout
@@ -161,10 +242,13 @@ class StructuredStatusPanel(QGroupBox):
         layout.addRow("Elapsed Time:", self.elapsed_label)
         layout.addRow("Phase 1 Elapsed:", self.phase1_elapsed_label)
         layout.addRow("Phase 2 Elapsed:", self.phase2_elapsed_label)
+        layout.addRow("ASR Stage 1:", self.asr_stage1_elapsed_label)
+        layout.addRow("ASR Stage 2:", self.asr_stage2_elapsed_label)
         layout.addRow("Total Elapsed:", self.total_elapsed_label)
         # Audio controls row removed from status panel
         layout.addRow("Time Remaining:", self.remaining_label)
-        layout.addRow("Realtime Factor:", self.realtime_label)
+        layout.addRow("Realtime RAW:", self.realtime_raw_label)
+        layout.addRow("Realtime Total:", self.realtime_total_label)
         layout.addRow("Audio Duration:", self.audio_duration_label)
         layout.addRow("Current Chunk:", self.current_chunk_label)
 
@@ -214,13 +298,33 @@ class StructuredStatusPanel(QGroupBox):
         eta=None,
         remaining=None,
         realtime=None,
+        realtime_total=None,
         audio_duration=None,
         chunk_info=None,
         phase1_elapsed=None,
         phase2_elapsed=None,
+        asr_stage1_elapsed=None,
+        asr_stage2_elapsed=None,
         total_elapsed=None,
     ):
-        """Update status panel fields"""
+        """Update status panel fields.
+
+        Args:
+            operation: Current status text shown in the operation row.
+            progress: Optional (current, total) tuple for the progress bar.
+            elapsed: Generation-span elapsed time shown as the raw realtime base.
+            eta: Unused legacy placeholder kept for call-site compatibility.
+            remaining: Remaining time string shown in the panel.
+            realtime: Raw realtime ratio from audio duration divided by generation span.
+            realtime_total: Whole-run realtime ratio from audio duration divided by total wall time.
+            audio_duration: Final audio duration string.
+            chunk_info: Optional chunk label override.
+            phase1_elapsed: Phase 1 duration string.
+            phase2_elapsed: Phase 2 duration string.
+            asr_stage1_elapsed: Stage 1 ASR duration string.
+            asr_stage2_elapsed: Stage 2 ASR duration string.
+            total_elapsed: Whole-run elapsed time string.
+        """
         if operation:
             self.operation_label.setText(operation)
         if progress is not None:
@@ -240,7 +344,9 @@ class StructuredStatusPanel(QGroupBox):
         if remaining:
             self.remaining_label.setText(remaining)
         if realtime and realtime != "Calculating...":
-            self.realtime_label.setText(realtime)
+            self.realtime_raw_label.setText(realtime)
+        if realtime_total and realtime_total != "Calculating...":
+            self.realtime_total_label.setText(realtime_total)
         if audio_duration:
             self.audio_duration_label.setText(audio_duration)
         if chunk_info:
@@ -249,6 +355,10 @@ class StructuredStatusPanel(QGroupBox):
             self.phase1_elapsed_label.setText(phase1_elapsed)
         if phase2_elapsed:
             self.phase2_elapsed_label.setText(phase2_elapsed)
+        if asr_stage1_elapsed:
+            self.asr_stage1_elapsed_label.setText(asr_stage1_elapsed)
+        if asr_stage2_elapsed:
+            self.asr_stage2_elapsed_label.setText(asr_stage2_elapsed)
         if total_elapsed:
             self.total_elapsed_label.setText(total_elapsed)
 
@@ -258,11 +368,14 @@ class StructuredStatusPanel(QGroupBox):
         self.progress_bar.setVisible(False)
         self.elapsed_label.setText("0:00:00")
         self.remaining_label.setText("--:--:--")
-        self.realtime_label.setText("--")
+        self.realtime_raw_label.setText("--")
+        self.realtime_total_label.setText("--")
         self.audio_duration_label.setText("00:00:00")
         self.current_chunk_label.setText("--")
         self.phase1_elapsed_label.setText("0:00:00")
         self.phase2_elapsed_label.setText("0:00:00")
+        self.asr_stage1_elapsed_label.setText("0:00:00")
+        self.asr_stage2_elapsed_label.setText("0:00:00")
         self.total_elapsed_label.setText("0:00:00")
 
 
@@ -475,17 +588,26 @@ class ProcessThread(QThread):
                 # Parse the completion summary
                 elapsed_match = re.search(r"Elapsed Time:.*?(\d+:\d{2}:\d{2})", combined)
                 audio_match = re.search(r"Audio Duration:.*?(\d+:\d{2}:\d{2})", combined)
-                realtime_match = re.search(r"Realtime Factor:.*?(\d+\.\d+)x", combined)
+                realtime_raw_match = re.search(
+                    r"Realtime (?:RAW|Factor):.*?(\d+\.\d+)x", combined
+                )
+                realtime_total_match = re.search(
+                    r"Realtime Total:.*?(\d+\.\d+)x", combined
+                )
 
                 # Only emit if all values were found
-                if elapsed_match and audio_match and realtime_match:
+                if elapsed_match and audio_match and realtime_raw_match:
                     status_data = {
                         "operation": "✅ Processing Complete!",
                         "elapsed": elapsed_match.group(1),
                         "audio": audio_match.group(1),
-                        "realtime": f"{realtime_match.group(1)}x",
+                        "realtime": f"{realtime_raw_match.group(1)}x",
                         "remaining": "0:00:00",
                     }
+                    if realtime_total_match:
+                        status_data["realtime_total"] = (
+                            f"{realtime_total_match.group(1)}x"
+                        )
                     self.structured_status_signal.emit(status_data)
                     # Clear the buffer to avoid re-triggering
                     self._recent_lines.clear()
@@ -594,6 +716,9 @@ class ChatterboxMainWindow(QMainWindow):
         # Track unsaved config changes
         self.config_has_unsaved_changes = False
         self.original_config_values = {}
+        self.batch_queue = self._load_batch_queue()
+        self.batch_running = False
+        self._current_batch_job = None
 
         # Central widget with tabs
         central_widget = QWidget()
@@ -611,6 +736,10 @@ class ChatterboxMainWindow(QMainWindow):
         self.main_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.main_scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
 
+        tabs_panel = QWidget()
+        tabs_panel_layout = QVBoxLayout(tabs_panel)
+        tabs_panel_layout.setContentsMargins(0, 0, 0, 0)
+
         # Create tab widget inside scroll area
         tab_container = QWidget()
         tab_layout = QVBoxLayout(tab_container)
@@ -623,7 +752,13 @@ class ChatterboxMainWindow(QMainWindow):
         self.tab_widget.currentChanged.connect(self.on_tab_changed)
 
         self.main_scroll_area.setWidget(tab_container)
-        splitter.addWidget(self.main_scroll_area)
+        tabs_panel_layout.addWidget(self.main_scroll_area, 1)
+        self.batch_queue_controls_widget = QWidget()
+        self.batch_queue_controls_widget.setVisible(False)
+        self.batch_queue_controls_layout = QHBoxLayout(self.batch_queue_controls_widget)
+        self.batch_queue_controls_layout.setContentsMargins(6, 3, 6, 3)
+        tabs_panel_layout.addWidget(self.batch_queue_controls_widget)
+        splitter.addWidget(tabs_panel)
 
         # Create output area widget (bottom part of splitter)
         output_widget = QWidget()
@@ -648,6 +783,9 @@ class ChatterboxMainWindow(QMainWindow):
         self.create_voice_analyzer_tab()
         self.create_audio_output_analyzer_tab()
         self.create_token_to_audio_tab()
+        self.create_batch_queue_tab()
+        self.tab_widget.currentChanged.connect(self._update_batch_queue_toolbar)
+        self._update_batch_queue_toolbar(self.tab_widget.currentIndex())
 
         # Status bar
         self.statusBar().showMessage("Ready")
@@ -813,97 +951,43 @@ class ChatterboxMainWindow(QMainWindow):
         self.asr_checkbox = QCheckBox("🎤 Enable ASR validation")
         self.asr_checkbox.setChecked(False)
         self.asr_checkbox.setToolTip(
-            "Smart quality control with automatic model selection"
+            "Two-stage Whisper check: Stage 1 on every chunk, Stage 2 only on fails"
         )
         checkbox_layout.addWidget(self.asr_checkbox)
 
-        # Similarity threshold spinner (always visible, on same line)
+        # Similarity threshold spinner stays glued to the "Similarity:" label
         threshold_label = QLabel("Similarity:")
         self.asr_threshold_spinner = NoScrollDoubleSpinBox()
+        self._attach_spin_reset(self.asr_threshold_spinner, "DEFAULT_ASR_THRESHOLD")
         self.asr_threshold_spinner.setRange(0.5, 1.0)
-        self.asr_threshold_spinner.setValue(0.75)
+        self.asr_threshold_spinner.setValue(float(DEFAULT_ASR_THRESHOLD))
         self.asr_threshold_spinner.setSingleStep(0.01)
         self.asr_threshold_spinner.setDecimals(2)
         self.asr_threshold_spinner.setMaximumWidth(80)
-        self.asr_threshold_spinner.setToolTip("Minimum similarity score (0.5-1.0) for validation to pass")
-        checkbox_layout.addWidget(threshold_label)
-        checkbox_layout.addWidget(self.asr_threshold_spinner)
+        self.asr_threshold_spinner.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.asr_threshold_spinner.setToolTip(
+            "Minimum spoken-compare score to pass (saved as DEFAULT_ASR_THRESHOLD)"
+        )
+        similarity_wrap = QWidget()
+        similarity_row = QHBoxLayout(similarity_wrap)
+        similarity_row.setContentsMargins(8, 0, 0, 0)
+        similarity_row.setSpacing(6)
+        similarity_row.addWidget(threshold_label)
+        similarity_row.addWidget(self.asr_threshold_spinner)
+        similarity_wrap.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        checkbox_layout.addWidget(similarity_wrap)
+        checkbox_layout.addStretch()
 
         vader_layout.addLayout(checkbox_layout)
-        # Sync micro-batching with VADER: if VADER is turned off, disable micro-batching
         try:
             self.vader_checkbox.stateChanged.connect(self.handle_vader_toggle)
         except Exception:
             pass
 
-        # ASR Configuration Section (always visible)
-        self.asr_config_group = QGroupBox("🔍 ASR Configuration")
-        self.asr_config_group.setVisible(False)
-        asr_config_layout = QVBoxLayout()
-
-        # System analysis section
-        analysis_layout = QHBoxLayout()
-        self.analyze_system_btn = QPushButton("🔍 Analyze System")
-        self.analyze_system_btn.setMaximumWidth(150)
-        analysis_layout.addWidget(self.analyze_system_btn)
-        analysis_layout.addStretch()
-        asr_config_layout.addLayout(analysis_layout)
-
-        self.system_analysis_text = QTextEdit()
-        self.system_analysis_text.setMaximumHeight(80)
-        self.system_analysis_text.setPlainText(
-            "Click 'Analyze System' to detect capabilities"
-        )
-        self.system_analysis_text.setReadOnly(True)
-        asr_config_layout.addWidget(self.system_analysis_text)
-
-        # ASR Level Selection
-        level_layout = QVBoxLayout()
-        level_label = QLabel("ASR Quality Level:")
-        level_label.setStyleSheet("font-weight: bold;")
-        level_layout.addWidget(level_label)
-
-        self.asr_level_group = QButtonGroup()
-
-        self.asr_safe_radio = QRadioButton("🟢 SAFE - Fast processing, basic accuracy")
-        self.asr_moderate_radio = QRadioButton(
-            "🟡 MODERATE - Balanced speed/accuracy (recommended)"
-        )
-        self.asr_insane_radio = QRadioButton(
-            "🔴 INSANE - Best accuracy, may stress system"
-        )
-
-        self.asr_moderate_radio.setChecked(True)  # Default to moderate
-
-        self.asr_level_group.addButton(self.asr_safe_radio, 0)
-        self.asr_level_group.addButton(self.asr_moderate_radio, 1)
-        self.asr_level_group.addButton(self.asr_insane_radio, 2)
-
-        level_layout.addWidget(self.asr_safe_radio)
-        level_layout.addWidget(self.asr_moderate_radio)
-        level_layout.addWidget(self.asr_insane_radio)
-        asr_config_layout.addLayout(level_layout)
-
-        # Selected models display
-        self.selected_models_text = QTextEdit()
-        self.selected_models_text.setMaximumHeight(60)
-        self.selected_models_text.setPlainText(
-            "Select level to see model configuration"
-        )
-        self.selected_models_text.setReadOnly(True)
-        asr_config_layout.addWidget(self.selected_models_text)
-
-        self.asr_config_group.setLayout(asr_config_layout)
-        vader_layout.addWidget(self.asr_config_group)
-
-        #        vader_info = QLabel("VADER dynamically adjusts TTS parameters based on emotional content of each chunk")
-        #        vader_info.setStyleSheet("color: #666; font-style: italic;")
-        #        vader_layout.addWidget(vader_info)
-
         layout.addLayout(vader_layout)
 
-        # Quality Enhancement Settings - Compact Horizontal Layout
-        quality_layout = QHBoxLayout()  # Changed to horizontal layout
+        # Quality Enhancement Settings — checkbox columns stay compact.
+        # Logo lives in its own grid column so it cannot pad this block.
 
         # Regeneration Loop Section
         regen_layout = QFormLayout()
@@ -917,7 +1001,10 @@ class ChatterboxMainWindow(QMainWindow):
         # Max attempts
         self.max_attempts_spin = NoScrollSpinBox()
         self._attach_spin_reset(self.max_attempts_spin, "MAX_REGENERATION_ATTEMPTS")
-        self.max_attempts_spin.setRange(1, 10)
+        self.max_attempts_spin.setRange(0, 10)
+        self.max_attempts_spin.setToolTip(
+            "Retries per confirmed fail. 0 = report-only (write JSON, do not resynthesize)."
+        )
         self.max_attempts_spin.setValue(MAX_REGENERATION_ATTEMPTS)
         self.max_attempts_spin.setMaximumWidth(60)  # Reduced width
         regen_layout.addRow("Max Attempts:", self.max_attempts_spin)
@@ -1007,58 +1094,53 @@ class ChatterboxMainWindow(QMainWindow):
         detection_widget = QWidget()
         detection_widget.setLayout(detection_layout)
 
-        quality_layout.addWidget(regen_widget)
-        quality_layout.addWidget(sentiment_widget)
-        quality_layout.addWidget(detection_widget)
+        regen_widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        sentiment_widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        detection_widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
 
-        # Add image and GPU display as 4th column to the right
-        image_gpu_widget = QWidget()
-        image_gpu_layout = QHBoxLayout()
-        image_gpu_layout.setContentsMargins(5, 0, 0, 0)
-
-        # Image on left
-        image_label = QLabel()
+        logo_pixmap = QPixmap()
 #        image_path = Path(__file__).parent / "DNXSSW.png"
         image_path = Path(__file__).parent / "config" / "DNXSSW.png"
         if image_path.exists():
-            image_pixmap = QPixmap(str(image_path))
-            if not image_pixmap.isNull():
-                # Scale to 220px width maintaining aspect ratio
-                scaled_pixmap = image_pixmap.scaledToWidth(220, Qt.SmoothTransformation)
-                image_label.setPixmap(scaled_pixmap)
-                image_label.setAlignment(Qt.AlignCenter)
+            loaded = QPixmap(str(image_path))
+            if not loaded.isNull():
+                logo_pixmap = loaded
+        self.logo_label = FillColumnLogo(logo_pixmap, padding=8)
 
-        image_gpu_layout.addWidget(image_label)
-
-        # GPU display on right
+        # GPU display — height tracks the six stat lines, not the column
         self.gpu_label = QLabel("GPU: Loading...")
         self.gpu_label.setFont(QFont("Monospace", 9))
         self.gpu_label.setFixedWidth(220)
-        self.gpu_label.setAlignment(Qt.AlignCenter)
-        self.gpu_label.setStyleSheet("background-color: black; color: yellow; padding: 5px; border: 1px solid gray;")
-        image_gpu_layout.addWidget(self.gpu_label)
+        self.gpu_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.gpu_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.gpu_label.setStyleSheet("background-color: black; color: yellow; padding: 4px 6px; border: 1px solid gray;")
+        self._fit_gpu_label_height()
 
-        image_gpu_widget.setLayout(image_gpu_layout)
-        quality_layout.addWidget(image_gpu_widget)
+        # Grid stops at TTS Presets. Image column is only those two rows.
+        # Exaggeration / Min-P stay full width under this grid.
+        #   row 0: regen | sentiment | detection | logo (rowspan 2) | GPU
+        #   row 1: Load TTS Presets (cols 0-2)   |                  |
+        mid_grid = QGridLayout()
+        mid_grid.setContentsMargins(0, 0, 0, 0)
+        mid_grid.setHorizontalSpacing(8)
+        mid_grid.setVerticalSpacing(6)
+        mid_grid.addWidget(regen_widget, 0, 0, Qt.AlignTop)
+        mid_grid.addWidget(sentiment_widget, 0, 1, Qt.AlignTop)
+        mid_grid.addWidget(detection_widget, 0, 2, Qt.AlignTop)
+        mid_grid.addWidget(self.logo_label, 0, 3, 2, 1)
+        mid_grid.addWidget(self.gpu_label, 0, 4, Qt.AlignTop)
+        mid_grid.setColumnStretch(3, 1)
+        self._tab1_mid_grid = mid_grid
+
+        mid_widget = QWidget()
+        mid_widget.setLayout(mid_grid)
+        mid_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+        layout.addWidget(mid_widget)
 
         # Add GPU info timer
         self.gpu_timer = QTimer()
         self.gpu_timer.timeout.connect(self.update_gpu_info)
         self.gpu_timer.start(2000)
-
-        # Add overall info label below the sections
-        main_quality_layout = QVBoxLayout()
-        main_quality_layout.addLayout(quality_layout)
-
-        #        quality_info = QLabel("💡 These settings control the Phase 1 quality enhancement features")
-        #        quality_info.setStyleSheet("color: #666; font-style: italic; padding: 5px;")
-        #        main_quality_layout.addWidget(quality_info)
-
-        # Add the whole quality section to main layout
-        quality_container = QWidget()
-        quality_container.setLayout(main_quality_layout)
-
-        layout.addWidget(quality_container)
 
 
 
@@ -1080,18 +1162,6 @@ class ChatterboxMainWindow(QMainWindow):
         self.exaggeration_spin.setMaximumWidth(100)
         tts_layout.addRow("Exaggeration:", self.exaggeration_spin)
 
-        # CFG Weight - Tab 1 uses config limits
-        self.cfg_weight_spin = NoScrollDoubleSpinBox()
-        self._attach_spin_reset(self.cfg_weight_spin, "DEFAULT_CFG_WEIGHT")
-        self.cfg_weight_spin.setRange(
-            TTS_PARAM_MIN_CFG_WEIGHT, TTS_PARAM_MAX_CFG_WEIGHT
-        )
-        self.cfg_weight_spin.setSingleStep(0.1)
-        self.cfg_weight_spin.setValue(DEFAULT_CFG_WEIGHT)
-        self.cfg_weight_spin.setDecimals(2)
-        self.cfg_weight_spin.setMaximumWidth(100)
-        tts_layout.addRow("CFG Weight:", self.cfg_weight_spin)
-
         # Temperature - Tab 1 uses config limits
         self.temperature_spin = NoScrollDoubleSpinBox()
         self._attach_spin_reset(self.temperature_spin, "DEFAULT_TEMPERATURE")
@@ -1103,6 +1173,21 @@ class ChatterboxMainWindow(QMainWindow):
         self.temperature_spin.setDecimals(2)
         self.temperature_spin.setMaximumWidth(100)
         tts_layout.addRow("Temperature:", self.temperature_spin)
+
+        self.cfg_weight_spin = NoScrollDoubleSpinBox()
+        self._attach_spin_reset(self.cfg_weight_spin, "DEFAULT_CFG_WEIGHT")
+        self.cfg_weight_spin.setRange(
+            TTS_PARAM_MIN_CFG_WEIGHT, TTS_PARAM_MAX_CFG_WEIGHT
+        )
+        self.cfg_weight_spin.setSingleStep(0.1)
+        self.cfg_weight_spin.setValue(DEFAULT_CFG_WEIGHT)
+        self.cfg_weight_spin.setDecimals(2)
+        self.cfg_weight_spin.setMaximumWidth(100)
+        self.cfg_weight_spin.setToolTip(
+            "T3 CFG for this session. Does not write config.py."
+        )
+        self.cfg_weight_spin.valueChanged.connect(self._on_live_cfg_changed)
+        tts_layout.addRow("CFG Weight:", self.cfg_weight_spin)
 
         # Advanced Sampling (Right)
         sampling_layout = QFormLayout()
@@ -1139,13 +1224,185 @@ class ChatterboxMainWindow(QMainWindow):
         self.repetition_penalty_spin.setMaximumWidth(100)
         sampling_layout.addRow("Rep. Penalty:", self.repetition_penalty_spin)
 
-        # Add groups to side-by-side layout
-        # Create containers for the parameter sections
+        t3_layout = QFormLayout()
+        self.t3_source_combo = QComboBox()
+        self.t3_source_combo.setMaximumWidth(220)
+        self.t3_source_combo.addItem("Standard (English T3)", "english")
+        self.t3_source_combo.addItem("Multilingual V2", "multilingual-v2")
+        self.t3_source_combo.addItem("Multilingual V3", "multilingual-v3")
+        try:
+            current_t3 = resolve_t3_source()
+        except Exception:
+            current_t3 = "multilingual-v3"
+        if current_t3 == "turbo":
+            current_t3 = "multilingual-v3"
+        idx = self.t3_source_combo.findData(current_t3)
+        if idx >= 0:
+            self.t3_source_combo.setCurrentIndex(idx)
+        self.t3_source_combo.currentIndexChanged.connect(self._on_t3_source_changed)
+        t3_layout.addRow("T3 Encoder:", self.t3_source_combo)
+
+        self.t3_language_combo = QComboBox()
+        self.t3_language_combo.setMaximumWidth(220)
+        from src.chatterbox_vllm.text_utils import SUPPORTED_LANGUAGES
+
+        for code, name in SUPPORTED_LANGUAGES.items():
+            self.t3_language_combo.addItem(f"{name} ({code})", code)
+        lang_idx = self.t3_language_combo.findData(getattr(_cfg, "T3_LANGUAGE", "en"))
+        if lang_idx >= 0:
+            self.t3_language_combo.setCurrentIndex(lang_idx)
+        t3_layout.addRow("T3 Language:", self.t3_language_combo)
+
+        self.s3gen_decoder_combo = QComboBox()
+        self.s3gen_decoder_combo.setMaximumWidth(220)
+        self.s3gen_decoder_combo.addItem("Turbo S3Gen", "turbo")
+        self.s3gen_decoder_combo.addItem("Standard S3Gen", "standard")
+        t3_layout.addRow("S3Gen:", self.s3gen_decoder_combo)
+        self._on_t3_source_changed()
+        self._on_live_cfg_changed(self.cfg_weight_spin.value())
+
         tts_widget = QWidget()
         tts_widget.setLayout(tts_layout)
+        tts_widget.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Maximum)
 
         sampling_widget = QWidget()
         sampling_widget.setLayout(sampling_layout)
+        sampling_widget.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Maximum)
+
+        t3_widget = QWidget()
+        t3_widget.setLayout(t3_layout)
+        t3_widget.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Maximum)
+
+        export_col = QVBoxLayout()
+        export_col.setSpacing(6)
+        export_col.setContentsMargins(0, 0, 0, 0)
+        type_row = QHBoxLayout()
+        type_row.setSpacing(8)
+        self.write_m4b_check = QCheckBox("M4B")
+        self.write_m4b_check.setChecked(bool(WRITE_M4B))
+        self.write_m4b_check.setToolTip(
+            "Build M4B from chunk WAVs. Does not require a full-book WAV."
+        )
+        type_row.addWidget(self.write_m4b_check)
+        self.write_mp3_check = QCheckBox("MP3")
+        self.write_mp3_check.setChecked(bool(WRITE_MP3))
+        self.write_mp3_check.setToolTip(
+            "With Chapterize: one MP3 per chapter. Without: one full-book MP3."
+        )
+        type_row.addWidget(self.write_mp3_check)
+        self.write_wav_check = QCheckBox("WAV")
+        self.write_wav_check.setChecked(bool(WRITE_WAV))
+        self.write_wav_check.setToolTip(
+            "Write the full stitched WAV. Skip when only M4B/MP3 are needed."
+        )
+        type_row.addWidget(self.write_wav_check)
+        type_row.addStretch()
+        export_col.addLayout(type_row)
+
+        self.chapterize_check = QCheckBox("Chapterize")
+        self.chapterize_check.setChecked(bool(CHAPTERIZE))
+        self.chapterize_check.setToolTip(
+            "Embed a chapter TOC in the M4B. Per-chapter MP3s when MP3 is also checked."
+        )
+        export_col.addWidget(self.chapterize_check)
+
+        heading_row = QHBoxLayout()
+        heading_row.setSpacing(6)
+        self.chapter_mode_combo = QComboBox()
+        self.chapter_mode_combo.setMaximumWidth(220)
+        self.chapter_mode_combo.addItem("Headings only", "headings_only")
+        self.chapter_mode_combo.addItem(
+            "Headings, otherwise minutes", "headings_or_minutes"
+        )
+        self.chapter_mode_combo.addItem(
+            "Headings + maximum duration", "headings_with_max"
+        )
+        saved_chapter_mode = str(CHAPTER_MODE or "headings_only")
+        mode_idx = self.chapter_mode_combo.findData(saved_chapter_mode)
+        self.chapter_mode_combo.setCurrentIndex(mode_idx if mode_idx >= 0 else 0)
+        self.chapter_mode_combo.setToolTip(
+            "Headings, otherwise minutes uses the minute cap only when no "
+            "Part/Chapter heading is detected."
+        )
+        heading_row.addWidget(self.chapter_mode_combo)
+        self.chapter_minutes_spin = NoScrollSpinBox()
+        self.chapter_minutes_spin.setRange(0, 180)
+        self.chapter_minutes_spin.setSingleStep(5)
+        self.chapter_minutes_spin.setValue(int(MAX_CHAPTER_MINUTES or 0))
+        self.chapter_minutes_spin.setMaximumWidth(70)
+        self.chapter_minutes_spin.setToolTip(
+            "Minute cap for headings_or_minutes / headings_with_max. 0 disables."
+        )
+        heading_row.addWidget(self.chapter_minutes_spin)
+        heading_row.addStretch()
+        export_col.addLayout(heading_row)
+        export_col.addStretch()
+        export_widget = QWidget()
+        export_widget.setLayout(export_col)
+        export_widget.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Maximum)
+
+        asr_col = QFormLayout()
+        asr_models = list(ASR_STAGE1_MODELS)
+        self.asr_stage1_backend_combo = QComboBox()
+        self.asr_stage1_backend_combo.setMaximumWidth(140)
+        self._fill_asr_backend_combo(
+            self.asr_stage1_backend_combo,
+            include_parakeet=True,
+            current=str(globals().get("ASR_STAGE1_BACKEND", "faster_whisper")),
+        )
+        self.asr_stage1_backend_combo.setToolTip(
+            "Stage 1 engine. Parakeet is Stage 1 only (one NeMo model)."
+        )
+        self.asr_stage1_combo = QComboBox()
+        self.asr_stage1_combo.setMaximumWidth(180)
+        self.asr_stage1_combo.addItems(asr_models)
+        stage1_default = str(ASR_STAGE1_MODEL)
+        if self.asr_stage1_combo.findText(stage1_default) >= 0:
+            self.asr_stage1_combo.setCurrentText(stage1_default)
+        else:
+            self.asr_stage1_combo.setCurrentText("base")
+        self.asr_stage1_combo.setToolTip(
+            "Stage 1 transcribes every chunk. Smaller is faster. Ignored for Parakeet."
+        )
+        stage1_row = QHBoxLayout()
+        stage1_row.addWidget(self.asr_stage1_backend_combo)
+        stage1_row.addWidget(self.asr_stage1_combo)
+        asr_col.addRow("Stage 1:", stage1_row)
+
+        self.asr_stage2_backend_combo = QComboBox()
+        self.asr_stage2_backend_combo.setMaximumWidth(140)
+        self._fill_asr_backend_combo(
+            self.asr_stage2_backend_combo,
+            include_parakeet=False,
+            current=str(globals().get("ASR_STAGE2_BACKEND", "faster_whisper")),
+        )
+        self.asr_stage2_backend_combo.setToolTip(
+            "Stage 2 engine. Faster-Whisper or whisper.cpp only."
+        )
+        self.asr_stage2_combo = QComboBox()
+        self.asr_stage2_combo.setMaximumWidth(180)
+        self.asr_stage2_combo.addItem("Disabled", "disabled")
+        for name in asr_models:
+            self.asr_stage2_combo.addItem(name, name)
+        self._set_stage2_combo(str(ASR_STAGE2_MODEL))
+        self.asr_stage2_combo.setToolTip(
+            "Independent Stage 2 verifier. Runs only on Stage 1 fails. "
+            "Disabled skips the second pass."
+        )
+        stage2_row = QHBoxLayout()
+        stage2_row.addWidget(self.asr_stage2_backend_combo)
+        stage2_row.addWidget(self.asr_stage2_combo)
+        asr_col.addRow("Stage 2:", stage2_row)
+        self.asr_stage1_combo.currentTextChanged.connect(self._on_stage1_model_changed)
+        self.asr_stage1_backend_combo.currentIndexChanged.connect(
+            self._on_stage1_backend_changed
+        )
+        self.asr_stage2_combo.currentIndexChanged.connect(self._on_stage2_model_changed)
+        self._on_stage1_backend_changed()
+        self._on_stage2_model_changed()
+        asr_widget = QWidget()
+        asr_widget.setLayout(asr_col)
+        asr_widget.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Maximum)
 
         # NEW: Presets (moved to be above TTS Parameters)
         preset_group = QGroupBox("⚡ Load TTS Presets")
@@ -1177,12 +1434,23 @@ class ChatterboxMainWindow(QMainWindow):
 
         preset_layout.addStretch()
 
-        # Add preset group to main layout
-        layout.addWidget(preset_group)
-
+        # Presets share the logo's bottom edge. Params are below the grid.
+        self._tab1_mid_grid.addWidget(preset_group, 1, 0, 1, 3)
+        params_container.setSpacing(16)
+        params_container.setContentsMargins(0, 0, 0, 0)
+        params_container.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         params_container.addWidget(tts_widget)
         params_container.addWidget(sampling_widget)
+        params_container.addWidget(t3_widget)
+        params_container.addWidget(export_widget)
+        params_container.addWidget(asr_widget)
+        params_container.addStretch(1)
         layout.addLayout(params_container)
+        self.chapterize_check.toggled.connect(self._update_chapter_export_controls)
+        self.chapter_mode_combo.currentIndexChanged.connect(
+            self._update_chapter_export_controls
+        )
+        self._update_chapter_export_controls()
 
         # Action Buttons with Batch Checkbox
         button_layout = QHBoxLayout()
@@ -1199,10 +1467,6 @@ class ChatterboxMainWindow(QMainWindow):
         self.tab1_reload_btn.setToolTip("Reload Tab 1 values from saved config")
         self.tab1_reload_btn.clicked.connect(self.reload_tab1_from_config)
         button_layout.addWidget(self.tab1_reload_btn)
-
-        # ASR Event Handlers
-        self.analyze_system_btn.clicked.connect(self.analyze_system)
-        self.asr_level_group.buttonClicked.connect(self.update_asr_models)
 
         # NEW: Preset Handler
         self.apply_preset_btn.clicked.connect(self.apply_preset)
@@ -1307,6 +1571,234 @@ class ChatterboxMainWindow(QMainWindow):
         self.current_m4b_file = None
 
         layout.addStretch()
+
+    def create_batch_queue_tab(self):
+        """Create Tab 12 for ordered queued conversion snapshots."""
+        tab = QWidget()
+        self.batch_queue_tab = tab
+        self.tab_widget.addTab(tab, "12. Batch Queue")
+        layout = QVBoxLayout(tab)
+
+        layout.addWidget(QLabel("Queued conversions run one at a time in listed order."))
+        controls = self.batch_queue_controls_layout
+        self.run_batch_queue_btn = QPushButton("Run Batch Queue")
+        self.run_batch_queue_btn.clicked.connect(self.run_batch_queue)
+        controls.addWidget(self.run_batch_queue_btn)
+
+        self.batch_move_up_btn = QPushButton("Move Up")
+        self.batch_move_up_btn.clicked.connect(lambda: self.move_selected_batch_job(-1))
+        controls.addWidget(self.batch_move_up_btn)
+
+        self.batch_move_down_btn = QPushButton("Move Down")
+        self.batch_move_down_btn.clicked.connect(lambda: self.move_selected_batch_job(1))
+        controls.addWidget(self.batch_move_down_btn)
+
+        self.batch_edit_btn = QPushButton("Edit")
+        self.batch_edit_btn.clicked.connect(self.edit_selected_batch_job)
+        controls.addWidget(self.batch_edit_btn)
+
+        self.batch_remove_btn = QPushButton("Remove")
+        self.batch_remove_btn.clicked.connect(self.remove_selected_batch_job)
+        controls.addWidget(self.batch_remove_btn)
+
+        self.batch_clear_btn = QPushButton("Clear All")
+        self.batch_clear_btn.clicked.connect(self.clear_batch_queue)
+        controls.addWidget(self.batch_clear_btn)
+
+        self.batch_queue_status = QLabel()
+        controls.addWidget(self.batch_queue_status)
+        controls.addStretch()
+
+        queue_splitter = QSplitter(Qt.Vertical)
+        queue_splitter.setChildrenCollapsible(False)
+        self.batch_queue_list = QListWidget()
+        self.batch_queue_list.setSelectionMode(QListWidget.SingleSelection)
+        self.batch_queue_list.itemSelectionChanged.connect(self._update_batch_queue_controls)
+        queue_splitter.addWidget(self.batch_queue_list)
+
+        self.batch_queue_detail = QTextEdit()
+        self.batch_queue_detail.setReadOnly(True)
+        self.batch_queue_detail.setPlaceholderText("Select queued item to inspect captured settings.")
+        queue_splitter.addWidget(self.batch_queue_detail)
+        queue_splitter.setSizes([260, 240])
+        layout.addWidget(queue_splitter, 1)
+        self._refresh_batch_queue()
+
+    def _update_batch_queue_toolbar(self, index):
+        """Show fixed queue controls only while Tab 12 is active."""
+        if hasattr(self, "batch_queue_tab"):
+            self.batch_queue_controls_widget.setVisible(
+                self.tab_widget.widget(index) is self.batch_queue_tab
+            )
+
+    def _load_batch_queue(self):
+        """Load persisted queue early without preventing GUI startup on corruption."""
+        try:
+            return load_queue(AUDIOBOOK_ROOT)
+        except Exception as exc:
+            print(f"⚠️ Could not load batch queue: {exc}")
+            return []
+
+    def _save_batch_queue(self):
+        """Persist queue order and surface write failures in the GUI log."""
+        try:
+            save_queue(AUDIOBOOK_ROOT, self.batch_queue)
+            return True
+        except Exception as exc:
+            self.log_output(f"❌ Could not save batch queue: {exc}")
+            QMessageBox.critical(self, "Batch queue error", str(exc))
+            return False
+
+    def _refresh_batch_queue(self, selected_id=None):
+        """Redraw queued jobs while retaining selection by immutable job id."""
+        if not hasattr(self, "batch_queue_list"):
+            return
+        selected_id = selected_id or self._selected_batch_job_id()
+        self.batch_queue_list.blockSignals(True)
+        self.batch_queue_list.clear()
+        for index, job in enumerate(self.batch_queue, 1):
+            item = QListWidgetItem(self._batch_queue_item_label(index, job))
+            item.setData(Qt.UserRole, job.get("id"))
+            self.batch_queue_list.addItem(item)
+            if job.get("id") == selected_id:
+                self.batch_queue_list.setCurrentItem(item)
+        self.batch_queue_list.blockSignals(False)
+        self._update_batch_queue_controls()
+
+    def _batch_queue_item_label(self, index, job):
+        """Build compact list text while full settings remain in detail pane."""
+        tts = job.get("tts_params") or {}
+        return (
+            f"{index}. {Path(job.get('text_file', '')).name} | "
+            f"{Path(job.get('voice_path', '')).name} | "
+            f"{tts.get('t3_source', 'N/A')} / {tts.get('s3gen_decoder', 'N/A')}"
+        )
+
+    def _selected_batch_job_id(self):
+        """Return selected queue job id, or None when no job is selected."""
+        item = self.batch_queue_list.currentItem() if hasattr(self, "batch_queue_list") else None
+        return item.data(Qt.UserRole) if item else None
+
+    def _selected_batch_index(self):
+        """Resolve current QListWidget selection to its queue-list index."""
+        job_id = self._selected_batch_job_id()
+        for index, job in enumerate(self.batch_queue):
+            if job.get("id") == job_id:
+                return index
+        return None
+
+    def _update_batch_queue_controls(self):
+        """Synchronize selected-job details and button availability."""
+        if not hasattr(self, "batch_queue_list"):
+            return
+        index = self._selected_batch_index()
+        selected = index is not None
+        running = self.batch_running
+        self.run_batch_queue_btn.setEnabled(bool(self.batch_queue) and not running)
+        self.batch_move_up_btn.setEnabled(selected and index > 0 and not running)
+        self.batch_move_down_btn.setEnabled(
+            selected and index < len(self.batch_queue) - 1 and not running
+        )
+        self.batch_edit_btn.setEnabled(selected and not running)
+        self.batch_remove_btn.setEnabled(selected and not running)
+        self.batch_clear_btn.setEnabled(bool(self.batch_queue) and not running)
+        if selected:
+            self.batch_queue_detail.setPlainText(self._format_batch_job_details(self.batch_queue[index]))
+        else:
+            self.batch_queue_detail.clear()
+        state = "Running" if running else "Ready"
+        self.batch_queue_status.setText(f"{state}: {len(self.batch_queue)} queued job(s)")
+
+    def _format_batch_job_details(self, job):
+        """Show every immutable queued setting in a readable selected-job view."""
+        return "\n".join(
+            [
+                f"Job: {job.get('id', '')}",
+                f"Queued: {job.get('queued_at', '')}",
+                f"Book folder: {job.get('book_dir', '')}",
+                f"Text input: {job.get('text_file', '')}",
+                f"Voice: {job.get('voice_path', '')}",
+                f"ASR enabled: {job.get('enable_asr', False)}",
+                f"ASR threshold: {job.get('asr_threshold', '')}",
+                f"ASR device: {job.get('asr_device', '')}",
+                "",
+                "TTS parameters:",
+                json.dumps(job.get("tts_params") or {}, indent=2, sort_keys=True),
+                "",
+                "Quality/export parameters:",
+                json.dumps(job.get("quality_params") or {}, indent=2, sort_keys=True),
+                "",
+                "Config parameters:",
+                json.dumps(job.get("config_params") or {}, indent=2, sort_keys=True),
+            ]
+        )
+
+    def move_selected_batch_job(self, offset):
+        """Move selected queued job one position and save its new order."""
+        index = self._selected_batch_index()
+        target = None if index is None else index + offset
+        if target is None or target < 0 or target >= len(self.batch_queue):
+            return
+        self.batch_queue[index], self.batch_queue[target] = (
+            self.batch_queue[target],
+            self.batch_queue[index],
+        )
+        selected_id = self.batch_queue[target].get("id")
+        if self._save_batch_queue():
+            self._refresh_batch_queue(selected_id)
+        else:
+            self.batch_queue[index], self.batch_queue[target] = (
+                self.batch_queue[target],
+                self.batch_queue[index],
+            )
+            self._refresh_batch_queue(selected_id)
+
+    def remove_selected_batch_job(self):
+        """Remove selected queued job and persist remaining order."""
+        index = self._selected_batch_index()
+        if index is None:
+            return
+        removed = self.batch_queue.pop(index)
+        if self._save_batch_queue():
+            self.log_output(f"Removed batch job: {Path(removed.get('text_file', '')).name}")
+            self._refresh_batch_queue()
+        else:
+            self.batch_queue.insert(index, removed)
+
+    def clear_batch_queue(self):
+        """Clear every queued job only after explicit user confirmation."""
+        if not self.batch_queue or self.batch_running:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Clear batch queue",
+            "Remove all queued conversion jobs?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        previous_queue = self.batch_queue[:]
+        self.batch_queue.clear()
+        if self._save_batch_queue():
+            self._refresh_batch_queue()
+        else:
+            self.batch_queue = previous_queue
+            self._refresh_batch_queue()
+
+    def edit_selected_batch_job(self):
+        """Load selected job into Main and remove it so edits cannot duplicate it."""
+        index = self._selected_batch_index()
+        if index is None:
+            return
+        job = self.batch_queue.pop(index)
+        if not self._save_batch_queue():
+            self.batch_queue.insert(index, job)
+            return
+        self._load_job_into_main(job)
+        self._refresh_batch_queue()
+        self.tab_widget.setCurrentIndex(0)
+        self.log_output(f"Loaded batch job for editing: {Path(job.get('text_file', '')).name}")
 
     def handle_micro_batching_toggle(self, state):
         """Toggle micro-batching based on the given state.
@@ -1427,6 +1919,7 @@ class ChatterboxMainWindow(QMainWindow):
             "TTS_BATCH_SIZE": "tts_batch_size",
             "MIN_CHUNK_WORDS": "min_chunk_words",
             "MAX_CHUNK_WORDS": "max_chunk_words",
+            "CHUNKING_MODE": "chunking_mode",
             "ENABLE_MID_DROP_CHECK": "enable_mid_drop_check",
             "ENABLE_HUM_DETECTION": "enable_hum_detection",
             "ENABLE_NORMALIZATION": "enable_normalization",
@@ -1474,7 +1967,11 @@ class ChatterboxMainWindow(QMainWindow):
             values["inline_period_ms"] = self.inline_period_spin.value()
             values["inline_question_ms"] = self.inline_question_spin.value()
             values["inline_exclamation_ms"] = self.inline_exclamation_spin.value()
-        
+        if hasattr(self, "chunking_mode_combo"):
+            values["chunking_mode"] = (
+                self.chunking_mode_combo.currentData() or "word_cap"
+            )
+
         return values
 
     def _show_spin_context_menu(self, spin, pos):
@@ -1536,6 +2033,7 @@ class ChatterboxMainWindow(QMainWindow):
             mapping = [
                 (self.max_attempts_spin, "MAX_REGENERATION_ATTEMPTS"),
                 (self.quality_threshold_spin, "QUALITY_THRESHOLD"),
+                (self.asr_threshold_spinner, "DEFAULT_ASR_THRESHOLD"),
                 (self.smoothing_window_spin, "SENTIMENT_SMOOTHING_WINDOW"),
                 (self.spectral_threshold_spin, "SPECTRAL_ANOMALY_THRESHOLD"),
                 (self.output_threshold_spin, "OUTPUT_VALIDATION_THRESHOLD"),
@@ -1565,6 +2063,36 @@ class ChatterboxMainWindow(QMainWindow):
                     spin.blockSignals(True)
                     spin.setValue(val)
                     spin.blockSignals(False)
+            self._on_live_cfg_changed(self.cfg_weight_spin.value())
+            if hasattr(self, "write_m4b_check"):
+                self.write_m4b_check.setChecked(bool(getattr(config_mod, "WRITE_M4B", True)))
+                self.write_mp3_check.setChecked(bool(getattr(config_mod, "WRITE_MP3", False)))
+                self.write_wav_check.setChecked(bool(getattr(config_mod, "WRITE_WAV", False)))
+                self.chapterize_check.setChecked(bool(getattr(config_mod, "CHAPTERIZE", False)))
+                mode = str(getattr(config_mod, "CHAPTER_MODE", "headings_only") or "headings_only")
+                idx = self.chapter_mode_combo.findData(mode)
+                if idx >= 0:
+                    self.chapter_mode_combo.setCurrentIndex(idx)
+                self.chapter_minutes_spin.setValue(
+                    int(getattr(config_mod, "MAX_CHAPTER_MINUTES", 0) or 0)
+                )
+                self._update_chapter_export_controls()
+            if hasattr(self, "asr_stage1_combo"):
+                if hasattr(self, "asr_stage1_backend_combo"):
+                    self._set_asr_backend_combo(
+                        self.asr_stage1_backend_combo,
+                        str(getattr(config_mod, "ASR_STAGE1_BACKEND", "faster_whisper")),
+                    )
+                    self._set_asr_backend_combo(
+                        self.asr_stage2_backend_combo,
+                        str(getattr(config_mod, "ASR_STAGE2_BACKEND", "faster_whisper")),
+                    )
+                    self._on_stage1_backend_changed()
+                stage1 = str(getattr(config_mod, "ASR_STAGE1_MODEL", "base"))
+                if self.asr_stage1_combo.findText(stage1) >= 0:
+                    self.asr_stage1_combo.setCurrentText(stage1)
+                self._set_stage2_combo(str(getattr(config_mod, "ASR_STAGE2_MODEL", "medium")))
+                self._on_stage2_model_changed()
             self.statusBar().showMessage("Reloaded Tab 1 from saved config", 2500)
         except Exception as e:
             self.statusBar().showMessage(f"Failed to reload Tab 1: {e}", 3000)
@@ -1653,11 +2181,23 @@ class ChatterboxMainWindow(QMainWindow):
 
         # Add descriptive text
         words_desc = QLabel(
-            "Set Min/Max for words in a text chunk. Too many\nwords can lead to poor TTS."
+            "Word cap: honor min and max (may split long sentences).\n"
+            "Sentence pack: glue full sentences until Min Words; ignore Max."
         )
         words_desc.setStyleSheet("font-size: 10px; color: #666; margin: 5px;")
         words_desc.setWordWrap(True)
         words_layout.addRow(words_desc)
+
+        self.chunking_mode_combo = QComboBox()
+        self.chunking_mode_combo.addItem("Word cap (current)", "word_cap")
+        self.chunking_mode_combo.addItem("Sentence pack (Pocket-style)", "sentence_pack")
+        saved_chunk_mode = str(getattr(_cfg, "CHUNKING_MODE", "word_cap") or "word_cap")
+        mode_i = self.chunking_mode_combo.findData(saved_chunk_mode)
+        self.chunking_mode_combo.setCurrentIndex(mode_i if mode_i >= 0 else 0)
+        self.chunking_mode_combo.setToolTip(
+            "Sentence pack never cuts inside a sentence and does not use Max Words."
+        )
+        words_layout.addRow("Chunking:", self.chunking_mode_combo)
 
         self.min_chunk_words_spin = NoScrollSpinBox()
         self._attach_spin_reset(self.min_chunk_words_spin, "MIN_CHUNK_WORDS")
@@ -1672,6 +2212,10 @@ class ChatterboxMainWindow(QMainWindow):
         self.max_chunk_words_spin.setValue(MAX_CHUNK_WORDS)
         self.max_chunk_words_spin.setMaximumWidth(60)
         words_layout.addRow("Max Words:", self.max_chunk_words_spin)
+        self.chunking_mode_combo.currentIndexChanged.connect(
+            self._update_chunking_mode_controls
+        )
+        self._update_chunking_mode_controls()
 
         # Audio Detection Group
         detection_group = QGroupBox()
@@ -1898,8 +2442,6 @@ class ChatterboxMainWindow(QMainWindow):
         t3_desc.setStyleSheet("font-size: 10px; color: #666; margin: 5px;")
         t3_desc.setWordWrap(True)
         t3_layout.addRow(t3_desc)
-
-        from config import config as _cfg
 
         self.max_t3_context_spin = NoScrollSpinBox()
         self._attach_spin_reset(self.max_t3_context_spin, "MAX_T3_CONTEXT")
@@ -2165,6 +2707,10 @@ class ChatterboxMainWindow(QMainWindow):
         self.enable_inline_pauses_checkbox = QCheckBox("Enable Inline Pauses")
         self.enable_inline_pauses_checkbox.setChecked(bool(ENABLE_PUNCTUATION_PAUSES))
         self._attach_config_key(self.enable_inline_pauses_checkbox, "ENABLE_PUNCTUATION_PAUSES")
+        self.enable_inline_pauses_checkbox.setToolTip(
+            "Split T3 at sentence-end . ? ! and insert digital silence. "
+            "Leave Comma at 0 — mid-sentence splits hallucinate."
+        )
         checkbox_layout.addWidget(self.enable_inline_pauses_checkbox)
         checkbox_layout.addStretch()
         inline_main_layout.addLayout(checkbox_layout)
@@ -2182,12 +2728,16 @@ class ChatterboxMainWindow(QMainWindow):
             question_val = getattr(config, PUNCTUATION_PAUSE_MAPPING.get('?', 'SILENCE_QUESTION_MARK'), 650)
             exclamation_val = getattr(config, PUNCTUATION_PAUSE_MAPPING.get('!', 'SILENCE_EXCLAMATION'), 200)
         except Exception:
-            comma_val, period_val, question_val, exclamation_val = 150, 550, 650, 200
+            comma_val, period_val, question_val, exclamation_val = 0, 300, 350, 200
         
         self.inline_comma_spin = NoScrollSpinBox()
         self.inline_comma_spin.setRange(0, 5000)
         self.inline_comma_spin.setValue(comma_val)
         self.inline_comma_spin.setMaximumWidth(60)
+        self.inline_comma_spin.setToolTip(
+            "0 = no T3 split at commas (recommended). Non-zero splits the "
+            "sentence into a new utterance and often hallucinates."
+        )
         
         self.inline_period_spin = NoScrollSpinBox()
         self.inline_period_spin.setRange(0, 5000)
@@ -2527,16 +3077,42 @@ class ChatterboxMainWindow(QMainWindow):
         book_group.setStyleSheet(
             "QGroupBox { border: 1px solid gray; border-radius: 3px; margin: 5px; padding-top: 10px; }"
         )
-        book_layout = QVBoxLayout(book_group)
+        book_layout = QHBoxLayout(book_group)
 
+        book_column = QVBoxLayout()
+        book_column.addWidget(QLabel("Select book to repair:"))
         self.repair_book_combo = QComboBox()
         self.repair_book_combo.currentTextChanged.connect(self.load_chunks_for_repair)
-        book_layout.addWidget(QLabel("Select book to repair:"))
-        book_layout.addWidget(self.repair_book_combo)
+        book_column.addWidget(self.repair_book_combo)
 
         refresh_books_btn = QPushButton("🔄 Refresh Book List")
         refresh_books_btn.clicked.connect(self.refresh_repair_books)
-        book_layout.addWidget(refresh_books_btn)
+        book_column.addWidget(refresh_books_btn)
+        book_layout.addLayout(book_column, 1)
+
+        voice_column = QVBoxLayout()
+        voice_column.addWidget(QLabel("🎤 Voice Selection"))
+        self.repair_voice_info = QLabel("No voice detected")
+        self.repair_voice_info.setStyleSheet(
+            "background-color: #f0f0f0; padding: 5px; border: 1px solid #ccc;"
+        )
+        voice_column.addWidget(self.repair_voice_info)
+        voice_column.addWidget(QLabel("Select voice for resynthesis:"))
+        self.repair_voice_combo = QComboBox()
+        self.repair_voice_combo.setStyleSheet(
+            """
+            QComboBox QAbstractItemView::item:first-child {
+                color: red;
+                font-style: italic;
+            }
+        """
+        )
+        voice_column.addWidget(self.repair_voice_combo)
+
+        refresh_voices_btn = QPushButton("🔄 Re-detect Voice Candidates")
+        refresh_voices_btn.clicked.connect(self.refresh_available_voices)
+        voice_column.addWidget(refresh_voices_btn)
+        book_layout.addLayout(voice_column, 1)
 
         layout.addWidget(book_group)
 
@@ -2546,55 +3122,73 @@ class ChatterboxMainWindow(QMainWindow):
             "QGroupBox { border: 1px solid gray; border-radius: 3px; margin: 5px; padding-top: 10px; }"
         )
         search_layout = QVBoxLayout(search_group)
+        search_controls_layout = QHBoxLayout()
 
-        search_layout.addWidget(QLabel("Search for text fragment:"))
+        text_search_column = QVBoxLayout()
+        text_search_column.addWidget(QLabel("Search for text fragment:"))
         self.repair_search_edit = QLineEdit()
         self.repair_search_edit.setPlaceholderText("Enter text to search for...")
         self.repair_search_edit.returnPressed.connect(self.search_chunks_for_repair)
-        search_layout.addWidget(self.repair_search_edit)
+        text_search_column.addWidget(self.repair_search_edit)
 
         search_btn = QPushButton("🔍 Search Chunks")
         search_btn.clicked.connect(self.search_chunks_for_repair)
-        search_layout.addWidget(search_btn)
+        text_search_column.addWidget(search_btn)
+        search_controls_layout.addLayout(text_search_column, 1)
 
-        # Direct chunk lookup subsection
-        search_layout.addWidget(QLabel(""))  # Spacer
-
-        # Horizontal layout for chunk number input and range display
+        chunk_nav_column = QVBoxLayout()
+        chunk_nav_column.addWidget(QLabel("Go to chunk:"))
         chunk_nav_layout = QHBoxLayout()
 
-        chunk_nav_layout.addWidget(QLabel("Or go to chunk:"))
-
-        # Chunk number text input (1-based for user-facing)
+        # Chunk number text input is 1-based to match audio filenames.
         self.chunk_number_input = QLineEdit()
         self.chunk_number_input.setPlaceholderText("Enter chunk number...")
         self.chunk_number_input.setMaximumWidth(150)
-        self.chunk_number_input.setEnabled(False)  # Disabled until book loaded
+        self.chunk_number_input.setEnabled(False)
         self.chunk_number_input.setToolTip("Enter chunk number (1-based, matching audio filenames)")
-        # Enable Enter key to trigger navigation
         self.chunk_number_input.returnPressed.connect(self.go_to_chunk_by_number)
         chunk_nav_layout.addWidget(self.chunk_number_input)
 
-        # Go button
         go_chunk_btn = QPushButton("📍 Go to Chunk")
         go_chunk_btn.clicked.connect(self.go_to_chunk_by_number)
         go_chunk_btn.setToolTip("Load the specified chunk for editing")
         chunk_nav_layout.addWidget(go_chunk_btn)
+        chunk_nav_column.addLayout(chunk_nav_layout)
 
-        # Range display label (shows "of N chunks" when loaded)
         self.chunk_range_label = QLabel("")
         self.chunk_range_label.setStyleSheet("color: gray; font-style: italic;")
-        chunk_nav_layout.addWidget(self.chunk_range_label)
+        chunk_nav_column.addWidget(self.chunk_range_label)
+        chunk_nav_column.addStretch()
+        search_controls_layout.addLayout(chunk_nav_column, 1)
 
-        chunk_nav_layout.addStretch()
-        search_layout.addLayout(chunk_nav_layout)
-
-        search_layout.addWidget(QLabel(""))  # Spacer before results
+        failure_report_column = QVBoxLayout()
+        failure_report_column.addWidget(QLabel("Load failure report:"))
+        self.repair_fail_report_combo = QComboBox()
+        self.repair_fail_report_combo.setToolTip(
+            "Choose any ASR, regeneration, or Investigation failure report from the book's TTS folder."
+        )
+        failure_report_column.addWidget(self.repair_fail_report_combo)
+        load_fail_btn = QPushButton("Load ASR Failures")
+        load_fail_btn.setToolTip(
+            "Fill the list with every failed chunk from the selected report"
+        )
+        load_fail_btn.clicked.connect(self.load_asr_failures_for_repair)
+        failure_report_column.addWidget(load_fail_btn)
+        failure_report_column.addStretch()
+        search_controls_layout.addLayout(failure_report_column, 1)
+        search_layout.addLayout(search_controls_layout)
 
         # Results list
         search_layout.addWidget(QLabel("Search Results:"))
         self.repair_results_list = QListWidget()
         self.repair_results_list.itemClicked.connect(self.select_chunk_for_repair)
+        self.repair_results_list.setMinimumHeight(240)
+        self.repair_results_list.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Expanding
+        )
+        self.repair_results_list.setStyleSheet(
+            "QListWidget { background-color: #fde2e2; }"
+        )
         search_layout.addWidget(self.repair_results_list)
 
         layout.addWidget(search_group)
@@ -2606,17 +3200,11 @@ class ChatterboxMainWindow(QMainWindow):
         )
         edit_layout = QVBoxLayout(edit_group)
 
-        # Chunk info display
-        self.repair_chunk_info = QLabel("No chunk selected")
-        self.repair_chunk_info.setStyleSheet(
-            "background-color: #f5f5f5; padding: 10px; border: 1px solid #ddd;"
-        )
-        edit_layout.addWidget(self.repair_chunk_info)
-
         # Text editing
         edit_layout.addWidget(QLabel("Chunk Text:"))
         self.repair_text_edit = QTextEdit()
         self.repair_text_edit.setMaximumHeight(100)
+        self.repair_text_edit.setStyleSheet("QTextEdit { background-color: #e2f1fd; }")
         edit_layout.addWidget(self.repair_text_edit)
 
         # Metadata editing
@@ -2657,9 +3245,10 @@ class ChatterboxMainWindow(QMainWindow):
         exag_label = QLabel("TTS Params - Exag:")
         self.repair_exag_spin = NoScrollDoubleSpinBox()
         self.repair_exag_spin.setRange(0.0, 3.0)
-        self.repair_exag_spin.setSingleStep(0.1)
-        self.repair_exag_spin.setDecimals(1)
+        self.repair_exag_spin.setSingleStep(0.05)
+        self.repair_exag_spin.setDecimals(2)
         self.repair_exag_spin.setMaximumWidth(80)
+        self.repair_exag_spin.setStyleSheet("QDoubleSpinBox { background-color: #e2f7df; }")
         tts_layout.addWidget(exag_label)
         tts_layout.addWidget(self.repair_exag_spin)
 
@@ -2667,9 +3256,10 @@ class ChatterboxMainWindow(QMainWindow):
         cfg_label = QLabel("CFG:")
         self.repair_cfg_spin = NoScrollDoubleSpinBox()
         self.repair_cfg_spin.setRange(0.0, 2.0)
-        self.repair_cfg_spin.setSingleStep(0.1)
-        self.repair_cfg_spin.setDecimals(1)
+        self.repair_cfg_spin.setSingleStep(0.05)
+        self.repair_cfg_spin.setDecimals(2)
         self.repair_cfg_spin.setMaximumWidth(80)
+        self.repair_cfg_spin.setStyleSheet("QDoubleSpinBox { background-color: #e2f7df; }")
         tts_layout.addWidget(cfg_label)
         tts_layout.addWidget(self.repair_cfg_spin)
 
@@ -2677,9 +3267,10 @@ class ChatterboxMainWindow(QMainWindow):
         temp_label = QLabel("Temp:")
         self.repair_temp_spin = NoScrollDoubleSpinBox()
         self.repair_temp_spin.setRange(0.0, 2.0)
-        self.repair_temp_spin.setSingleStep(0.1)
-        self.repair_temp_spin.setDecimals(1)
+        self.repair_temp_spin.setSingleStep(0.05)
+        self.repair_temp_spin.setDecimals(2)
         self.repair_temp_spin.setMaximumWidth(80)
+        self.repair_temp_spin.setStyleSheet("QDoubleSpinBox { background-color: #e2f7df; }")
         tts_layout.addWidget(temp_label)
         tts_layout.addWidget(self.repair_temp_spin)
 
@@ -2714,42 +3305,6 @@ class ChatterboxMainWindow(QMainWindow):
         edit_layout.addLayout(actions_layout)
         layout.addWidget(edit_group)
 
-        # Voice selection section
-        voice_group = QGroupBox("🎤 Voice Selection")
-        voice_group.setStyleSheet(
-            "QGroupBox { border: 1px solid gray; border-radius: 3px; margin: 5px; padding-top: 10px; }"
-        )
-        voice_layout = QVBoxLayout(voice_group)
-
-        # Voice detection info
-        self.repair_voice_info = QLabel("No voice detected")
-        self.repair_voice_info.setStyleSheet(
-            "background-color: #f0f0f0; padding: 5px; border: 1px solid #ccc;"
-        )
-        voice_layout.addWidget(self.repair_voice_info)
-
-        # Voice selection dropdown
-        voice_layout.addWidget(QLabel("Select voice for resynthesis:"))
-        self.repair_voice_combo = QComboBox()
-
-        # Style the first item (placeholder) in red
-        self.repair_voice_combo.setStyleSheet(
-            """
-            QComboBox QAbstractItemView::item:first-child {
-                color: red;
-                font-style: italic;
-            }
-        """
-        )
-
-        voice_layout.addWidget(self.repair_voice_combo)
-
-        refresh_voices_btn = QPushButton("🔄 Re-detect Voice Candidates")
-        refresh_voices_btn.clicked.connect(self.refresh_available_voices)
-        voice_layout.addWidget(refresh_voices_btn)
-
-        layout.addWidget(voice_group)
-
         # Initialize repair tool state
         self.current_repair_chunks = None
         self.current_repair_chunk = None
@@ -2757,6 +3312,7 @@ class ChatterboxMainWindow(QMainWindow):
         self.current_repair_audio_dir = None
         self.current_repair_voice_name = None
         self.current_repair_voice_path = None
+        self.current_repair_fail_info = {}
 
         # Initialize voice combo with placeholder
         self.repair_voice_combo.addItem("-- Please Select Voice --", None)
@@ -3144,65 +3700,119 @@ class ChatterboxMainWindow(QMainWindow):
 
 
     def analyze_system(self):
-        """Analyze system capabilities and display summary"""
+        """Legacy no-op; Stage 1/2 combos replaced the system-analyzer hint."""
+        return
+
+    def _fill_asr_backend_combo(
+        self, combo: QComboBox, include_parakeet: bool, current: str
+    ) -> None:
+        """Populate an ASR backend combo and select the stored value.
+
+        Args:
+            combo: Stage 1 or Stage 2 backend dropdown.
+            include_parakeet: True only for Stage 1.
+            current: Canonical backend id from config.
+        """
+        from modules.asr_stages import backend_is_available, normalize_backend
+
+        combo.clear()
+        combo.addItem("faster-whisper", "faster_whisper")
+        if backend_is_available("whisper_cpp"):
+            combo.addItem("whisper.cpp", "whisper_cpp")
+        if include_parakeet and backend_is_available("parakeet"):
+            combo.addItem("parakeet", "parakeet")
+        token = normalize_backend(current)
+        if token == "parakeet" and not include_parakeet:
+            token = "faster_whisper"
+        if combo.findData(token) < 0:
+            token = "faster_whisper"
+        index = combo.findData(token)
+        combo.setCurrentIndex(index if index >= 0 else 0)
+
+    def _set_asr_backend_combo(self, combo: QComboBox, backend: str) -> None:
+        """Select a stored backend id on a combo.
+
+        Args:
+            combo: Backend dropdown already filled.
+            backend: Canonical or alias backend name.
+        """
+        from modules.asr_stages import normalize_backend
+
+        token = normalize_backend(backend)
+        index = combo.findData(token)
+        if index < 0:
+            index = 0
+        combo.setCurrentIndex(index)
+
+    def _set_stage2_combo(self, model_name: str) -> None:
+        """Select the Stage 2 combo row matching a stored model token.
+
+        Args:
+            model_name: Whisper name or disabled/none/off.
+        """
+        token = str(model_name or "medium").strip().lower()
+        if token in {"", "disabled", "none", "off"}:
+            token = "disabled"
+        index = self.asr_stage2_combo.findData(token)
+        if index < 0:
+            index = self.asr_stage2_combo.findText(token)
+        self.asr_stage2_combo.setCurrentIndex(index if index >= 0 else 0)
+
+    def _on_stage1_model_changed(self, _text: str = "") -> None:
+        """Fill Stage 2 with the recommended larger verifier for Stage 1."""
+        from modules.asr_stages import is_parakeet_backend, recommended_stage_two_model
+
+        if is_parakeet_backend(self.asr_stage1_backend_combo.currentData()):
+            self._set_stage2_combo("medium")
+            return
+        stage1 = self.asr_stage1_combo.currentText().strip() or "base"
+        self._set_stage2_combo(recommended_stage_two_model(stage1))
+
+    def _on_stage1_backend_changed(self, _index: int = 0) -> None:
+        """Lock Stage 1 model when Parakeet is selected; restore Whisper sizes otherwise."""
+        from modules.asr_stages import PARAKEET_MODEL, is_parakeet_backend
+
+        parakeet = is_parakeet_backend(self.asr_stage1_backend_combo.currentData())
+        self.asr_stage1_combo.setEnabled(not parakeet)
+        self.asr_stage1_combo.blockSignals(True)
         try:
-            from modules.system_detector import get_system_profile, categorize_system
+            if parakeet:
+                if self.asr_stage1_combo.findText(PARAKEET_MODEL) < 0:
+                    self.asr_stage1_combo.addItem(PARAKEET_MODEL)
+                self.asr_stage1_combo.setCurrentText(PARAKEET_MODEL)
+            elif self.asr_stage1_combo.currentText() == PARAKEET_MODEL:
+                self.asr_stage1_combo.setCurrentText("base")
+        finally:
+            self.asr_stage1_combo.blockSignals(False)
 
-            profile = get_system_profile()
-            categories = categorize_system(profile)
+    def _on_stage2_model_changed(self, _index: int = 0) -> None:
+        """Disable the Stage 2 backend when Stage 2 is Disabled."""
+        from modules.asr_stages import is_stage_two_disabled
 
-            summary = "🖥️ System Profile:\n"
-            summary += f"VRAM: {profile['gpu']['total_mb']:,}MB total, {profile['available_vram_after_tts']:,}MB available after TTS ({categories['vram']} class)\n"
-            summary += f"RAM: {profile['ram']['total_mb']:,}MB total, {profile['ram']['available_mb']:,}MB available ({categories['ram']} class)\n"
-            summary += f"CPU: {profile['cpu_cores']} cores ({categories['cpu']} class)"
+        token = self.asr_stage2_combo.currentData() or self.asr_stage2_combo.currentText()
+        self.asr_stage2_backend_combo.setEnabled(not is_stage_two_disabled(str(token)))
 
-            if not profile["has_gpu"]:
-                summary += "\n⚠️ No CUDA GPU detected - ASR will run on CPU only"
+    def _update_chunking_mode_controls(self) -> None:
+        """Disable Max Words when sentence-pack mode is selected."""
+        if not hasattr(self, "chunking_mode_combo"):
+            return
+        pack = self.chunking_mode_combo.currentData() == "sentence_pack"
+        self.max_chunk_words_spin.setEnabled(not pack)
 
-            self.system_analysis_text.setPlainText(summary)
-
-            # Update models display for current selection
-            self.update_asr_models()
-
-        except Exception as e:
-            self.system_analysis_text.setPlainText(
-                f"❌ Error analyzing system: {str(e)}"
-            )
+    def _update_chapter_export_controls(self) -> None:
+        """Enable chapter strategy widgets only when Chapterize is checked."""
+        on = self.chapterize_check.isChecked()
+        self.chapter_mode_combo.setEnabled(on)
+        mode = self.chapter_mode_combo.currentData() or "headings_only"
+        minutes_needed = on and mode in {
+            "headings_or_minutes",
+            "headings_with_max",
+        }
+        self.chapter_minutes_spin.setEnabled(minutes_needed)
 
     def update_asr_models(self):
-        """Update ASR model display based on selected level"""
-        try:
-            from modules.system_detector import get_system_profile, recommend_asr_models
-
-            profile = get_system_profile()
-            recommendations = recommend_asr_models(profile)
-
-            # Get selected level
-            level_map = {0: "safe", 1: "moderate", 2: "insane"}
-            selected_id = self.asr_level_group.checkedId()
-            if selected_id == -1:
-                selected_id = 1  # Default to moderate
-
-            asr_level = level_map[selected_id]
-
-            if asr_level not in recommendations:
-                self.selected_models_text.setPlainText("❌ Invalid ASR level selected")
-                return
-
-            config = recommendations[asr_level]
-            primary = config["primary"]
-            fallback = config["fallback"]
-
-            result = f"Primary: {primary['model']} on {primary['device'].upper()}\n"
-            result += f"Fallback: {fallback['model']} on {fallback['device'].upper()}"
-
-            if asr_level == "insane":
-                result += "\n⚠️ WARNING: INSANE mode may cause memory pressure"
-
-            self.selected_models_text.setPlainText(result)
-
-        except Exception as e:
-            self.selected_models_text.setPlainText(f"❌ Error getting models: {str(e)}")
+        """Legacy no-op; Stage 1/2 combos are the live ASR selectors."""
+        return
 
     def apply_preset(self):
         """Applies a selected preset from the combo box.
@@ -3325,6 +3935,28 @@ class ChatterboxMainWindow(QMainWindow):
         # This method is kept for compatibility but no longer displays anything
         pass
 
+    def _on_t3_source_changed(self, *_args):
+        """Enable language combo only for multilingual V2/V3 T3 checkpoints."""
+        source = self.t3_source_combo.currentData()
+        self.t3_language_combo.setEnabled(source in ("multilingual-v2", "multilingual-v3"))
+
+    def _on_live_cfg_changed(self, value):
+        """Apply T3 CFG for this process only; do not write config.py.
+
+        vLLM reads CHATTERBOX_CFG_SCALE at engine load. Updating the env var and
+        in-memory DEFAULT_CFG_WEIGHT here means Start Conversion uses the spinner
+        without treating it as an unsaved config-file edit.
+        """
+        cfg_val = float(value)
+        os.environ["CHATTERBOX_CFG_SCALE"] = str(cfg_val)
+        try:
+            config_mod.DEFAULT_CFG_WEIGHT = cfg_val
+            if hasattr(config_mod, "BASE_CFG_WEIGHT"):
+                config_mod.BASE_CFG_WEIGHT = cfg_val
+            _cfg.DEFAULT_CFG_WEIGHT = cfg_val
+        except Exception:
+            pass
+
     def start_conversion(self):
         """Starts the conversion process by calling `start_standard_conversion`.
         Args:
@@ -3335,20 +3967,34 @@ class ChatterboxMainWindow(QMainWindow):
         self.start_standard_conversion()
 
     def start_standard_conversion(self):
-        """Starts the standard conversion process by resetting the status panel and updating its status to "Starting...". Validates that required inputs (book path, voice path, text file) are selected; if not, logs an error message and returns."""
-        self.log_output("🚀 Starting conversion process...")
-        self.tab1_status_panel.reset()
-        self.tab1_status_panel.update_status(operation="Starting...")
-
-        book_path = self.book_path_edit.text()
-        voice_path = self.voice_path_edit.text()
-        text_file = self.text_file_combo.currentText()
-
-        if not all([book_path, voice_path, text_file]):
-            self.log_output("❌ Please select a book folder, voice sample, and text file.")
+        """Queue or start one immutable snapshot from current Main-tab controls."""
+        job = self._capture_conversion_job()
+        if job is None:
             return
+        if self.add_to_batch_checkbox.isChecked():
+            self.batch_queue.append(job)
+            if not self._save_batch_queue():
+                self.batch_queue.pop()
+                return
+            self._refresh_batch_queue(job["id"])
+            self.log_output(f"Queued batch job: {Path(job['text_file']).name}")
+            return
+        self._start_direct_conversion(job)
 
-        # Get TTS parameters from the GUI
+    def _capture_conversion_job(self):
+        """Validate Main-tab inputs and return a JSON-safe conversion snapshot."""
+        book_dir = Path(self.book_path_edit.text()).expanduser()
+        voice_path = Path(self.voice_path_edit.text()).expanduser()
+        selected_text = self.text_file_combo.currentData() or self.text_file_combo.currentText()
+        text_path = Path(str(selected_text)).expanduser()
+        if not text_path.is_absolute():
+            text_path = book_dir / text_path
+        if not book_dir.is_dir() or not text_path.is_file() or not voice_path.is_file():
+            self.log_output("❌ Select existing book folder, text file, and voice sample.")
+            return None
+        if not self._validate_selected_asr_backends():
+            return None
+
         tts_params = {
             "exaggeration": self.exaggeration_spin.value(),
             "cfg_weight": self.cfg_weight_spin.value(),
@@ -3357,9 +4003,10 @@ class ChatterboxMainWindow(QMainWindow):
             "top_p": self.top_p_spin.value(),
             "repetition_penalty": self.repetition_penalty_spin.value(),
             "use_vader": self.vader_checkbox.isChecked(),
+            "t3_source": self.t3_source_combo.currentData(),
+            "t3_language": self.t3_language_combo.currentData(),
+            "s3gen_decoder": self.s3gen_decoder_combo.currentData(),
         }
-
-        # Get quality enhancement parameters from the GUI
         quality_params = {
             "regeneration_enabled": self.regeneration_enabled_checkbox.isChecked(),
             "quality_threshold": self.quality_threshold_spin.value(),
@@ -3371,44 +4018,310 @@ class ChatterboxMainWindow(QMainWindow):
             "spectral_threshold": self.spectral_threshold_spin.value(),
             "output_validation": self.output_validation_checkbox.isChecked(),
             "output_threshold": self.output_threshold_spin.value(),
+            "asr_stage1_model": self.asr_stage1_combo.currentText().strip() or "base",
+            "asr_stage2_model": self.asr_stage2_combo.currentData()
+            or self.asr_stage2_combo.currentText()
+            or "medium",
+            "asr_stage1_backend": self.asr_stage1_backend_combo.currentData()
+            or "faster_whisper",
+            "asr_stage2_backend": self.asr_stage2_backend_combo.currentData()
+            or "faster_whisper",
+            "write_m4b": self.write_m4b_check.isChecked(),
+            "write_mp3": self.write_mp3_check.isChecked(),
+            "write_wav": self.write_wav_check.isChecked(),
+            "chapterize": self.chapterize_check.isChecked(),
+            "chapter_mode": self.chapter_mode_combo.currentData() or "headings_only",
+            "max_chapter_minutes": self.chapter_minutes_spin.value(),
+        }
+        return {
+            "id": uuid4().hex,
+            "queued_at": datetime.now().isoformat(timespec="seconds"),
+            "book_dir": str(book_dir.resolve()),
+            "text_file": str(text_path.resolve()),
+            "voice_path": str(voice_path.resolve()),
+            "tts_params": tts_params,
+            "quality_params": quality_params,
+            "config_params": self._build_effective_settings(),
+            "enable_asr": self.asr_checkbox.isChecked(),
+            "asr_threshold": self.asr_threshold_spinner.value(),
+            "asr_level": self.asr_stage1_combo.currentText().strip() or "base",
+            "asr_device": "cuda" if self.asr_gpu_checkbox.isChecked() else "cpu",
         }
 
-        # Get config parameters from the GUI
-        config_params = self._build_effective_settings()
+    def _validate_selected_asr_backends(self):
+        """Reject unavailable ASR backends before direct or queued conversion."""
+        if not self.asr_checkbox.isChecked():
+            return True
+        from modules.asr_stages import backend_missing_reason, is_stage_two_disabled
 
-        # Collect ASR threshold
-        enable_asr = self.asr_checkbox.isChecked()
-        asr_threshold = self.asr_threshold_spinner.value()
-        # Same level_map used by update_asr_models's preview text -- captured
-        # here too since that method never actually fed the real pipeline before.
-        asr_level_map = {0: "safe", 1: "moderate", 2: "insane"}
-        asr_level = asr_level_map.get(self.asr_level_group.checkedId(), "moderate")
-        asr_device = "cuda" if self.asr_gpu_checkbox.isChecked() else "cpu"
+        checks = [("Stage 1", self.asr_stage1_backend_combo.currentData() or "faster_whisper")]
+        stage2 = self.asr_stage2_combo.currentData() or self.asr_stage2_combo.currentText()
+        if not is_stage_two_disabled(str(stage2)):
+            checks.append(("Stage 2", self.asr_stage2_backend_combo.currentData() or "faster_whisper"))
+        for label, backend in checks:
+            reason = backend_missing_reason(backend)
+            if reason:
+                self.log_output(f"❌ {label} ASR: {reason}")
+                QMessageBox.critical(self, "ASR engine not installed", f"{label}: {reason}")
+                return False
+        return True
 
-        # Use a thread to run the process_book_folder function
+    def _start_direct_conversion(self, job):
+        """Launch one Main-tab conversion using its captured settings snapshot."""
+        self.log_output("🚀 Starting conversion process...")
+        self.tab1_status_panel.reset()
+        self.tab1_status_panel.update_status(operation="Starting...")
         self.process_thread = ProcessThread(
             process_book_folder,
-            book_dir=Path(book_path),
-            voice_path=Path(voice_path),
-            tts_params=tts_params,
+            book_dir=Path(job["book_dir"]),
+            voice_path=Path(job["voice_path"]),
+            tts_params=job["tts_params"],
             device=get_best_available_device(),
-            enable_asr=enable_asr,
-            asr_threshold=asr_threshold,
-            asr_level=asr_level,
-            asr_device=asr_device,
-            quality_params=quality_params,
-            config_params=config_params,
-            specific_text_file=Path(book_path) / text_file
+            enable_asr=job["enable_asr"],
+            asr_threshold=job["asr_threshold"],
+            asr_level=job["asr_level"],
+            asr_device=job["asr_device"],
+            quality_params=job["quality_params"],
+            config_params=job["config_params"],
+            specific_text_file=Path(job["text_file"]),
         )
-
         self.process_thread.output_signal.connect(self.log_output)
         self.process_thread.status_signal.connect(self.statusBar().showMessage)
         self.process_thread.structured_status_signal.connect(self.update_tab1_status_panel)
         self.process_thread.finished_signal.connect(self.on_conversion_finished)
         self.process_thread.start()
-
         self.convert_btn.setEnabled(False)
         self.convert_btn.setText("🔄 Converting...")
+
+    def run_batch_queue(self):
+        """Start queued jobs serially so TTS and ASR never overlap across books."""
+        if self.batch_running or not self.batch_queue:
+            return
+        self.batch_running = True
+        self.log_output(f"Starting batch queue: {len(self.batch_queue)} job(s)")
+        self._refresh_batch_queue()
+        self._start_next_batch_job()
+
+    def _start_next_batch_job(self):
+        """Launch first remaining queue job or finish once queue is empty."""
+        if not self.batch_running:
+            return
+        if not self.batch_queue:
+            self.batch_running = False
+            self._current_batch_job = None
+            self.convert_btn.setEnabled(True)
+            self.convert_btn.setText("🚀 Start Conversion")
+            self.log_output("✅ Batch queue complete.")
+            self._refresh_batch_queue()
+            return
+        job = self.batch_queue[0]
+        self._current_batch_job = job
+        self.tab1_status_panel.reset()
+        self.tab1_status_panel.update_status(operation=f"Batch: {Path(job['text_file']).name}")
+        self.process_thread = ProcessThread(self._run_batch_job, job, get_best_available_device())
+        self.process_thread.output_signal.connect(self.log_output)
+        self.process_thread.status_signal.connect(self.statusBar().showMessage)
+        self.process_thread.structured_status_signal.connect(self.update_tab1_status_panel)
+        self.process_thread.finished_signal.connect(self._on_batch_job_finished)
+        self.process_thread.start()
+        self.convert_btn.setEnabled(False)
+        self.convert_btn.setText("🔄 Batch Running...")
+        self._refresh_batch_queue(job["id"])
+
+    def _run_batch_job(self, job, device):
+        """Run one queue snapshot and append its report block on every outcome."""
+        started_at = datetime.now()
+        try:
+            result = process_book_folder(
+                book_dir=Path(job["book_dir"]),
+                voice_path=Path(job["voice_path"]),
+                tts_params=job["tts_params"],
+                device=device,
+                enable_asr=job["enable_asr"],
+                asr_threshold=job["asr_threshold"],
+                asr_level=job["asr_level"],
+                asr_device=job["asr_device"],
+                quality_params=job["quality_params"],
+                config_params=job["config_params"],
+                specific_text_file=Path(job["text_file"]),
+            )
+        except Exception as exc:
+            self._append_batch_job_report(job, started_at, False, str(exc))
+            raise
+        self._append_batch_job_report(job, started_at, True)
+        return result
+
+    def _append_batch_job_report(self, job, started_at, success, error=""):
+        """Write nonfatal root report entry from current engine artifacts."""
+        try:
+            from modules.file_manager import sanitize_filename
+
+            tts_dir = AUDIOBOOK_ROOT / sanitize_filename(Path(job["book_dir"]).name) / "TTS"
+            log_paths = [
+                path for path in tts_dir.glob("run_*.log")
+                if path.stat().st_mtime >= started_at.timestamp() - 2
+            ]
+            latest_log = max(log_paths, key=lambda path: path.stat().st_mtime) if log_paths else None
+            metrics = parse_timestamped_run_log(latest_log)
+            metrics.update(parse_asr_summary(tts_dir / "asr_run_summary.json"))
+            report = append_batch_report(
+                AUDIOBOOK_ROOT,
+                job,
+                started_at,
+                datetime.now(),
+                success,
+                metrics,
+                error,
+            )
+            print(f"📝 Batch run report updated: {report}")
+        except Exception as exc:
+            print(f"⚠️ Could not append batch run report: {exc}")
+
+    def _on_batch_job_finished(self, success, message):
+        """Remove completed job, persist queue, and schedule next queued conversion."""
+        job = self._current_batch_job
+        if job is None:
+            return
+        if self.batch_queue and self.batch_queue[0].get("id") == job.get("id"):
+            self.batch_queue.pop(0)
+        if not self._save_batch_queue():
+            self.batch_queue.insert(0, job)
+            self.batch_running = False
+            self.convert_btn.setEnabled(True)
+            self.convert_btn.setText("🚀 Start Conversion")
+            self._refresh_batch_queue()
+            return
+        status = "completed" if success else f"failed: {message}"
+        self.log_output(f"Batch job {status}: {Path(job['text_file']).name}")
+        self._current_batch_job = None
+        self._refresh_batch_queue()
+        QTimer.singleShot(0, self._start_next_batch_job)
+
+    def _load_job_into_main(self, job):
+        """Restore queued snapshot into editable Main and Config tab controls."""
+        text_path = Path(job["text_file"])
+        self.book_path_edit.setText(job["book_dir"])
+        self.populate_text_files(job["book_dir"])
+        text_index = self.text_file_combo.findData(str(text_path))
+        if text_index < 0:
+            text_index = self.text_file_combo.findText(text_path.name)
+        if text_index >= 0:
+            self.text_file_combo.setCurrentIndex(text_index)
+        self.voice_path_edit.setText(job["voice_path"])
+        self.voice_play_btn.setEnabled(True)
+        tts = job["tts_params"]
+        self._set_spin_value(self.exaggeration_spin, tts.get("exaggeration"))
+        self._set_spin_value(self.cfg_weight_spin, tts.get("cfg_weight"))
+        self._set_spin_value(self.temperature_spin, tts.get("temperature"))
+        self._set_spin_value(self.min_p_spin, tts.get("min_p"))
+        self._set_spin_value(self.top_p_spin, tts.get("top_p"))
+        self._set_spin_value(self.repetition_penalty_spin, tts.get("repetition_penalty"))
+        self.vader_checkbox.setChecked(bool(tts.get("use_vader", True)))
+        self._set_combo_data(self.t3_source_combo, tts.get("t3_source"))
+        self._set_combo_data(self.t3_language_combo, tts.get("t3_language"))
+        self._set_combo_data(self.s3gen_decoder_combo, tts.get("s3gen_decoder"))
+        self._restore_quality_params(job["quality_params"])
+        self.asr_checkbox.setChecked(bool(job.get("enable_asr")))
+        self._set_spin_value(self.asr_threshold_spinner, job.get("asr_threshold"))
+        self.asr_gpu_checkbox.setChecked(job.get("asr_device") == "cuda")
+        self._restore_runtime_settings(job["config_params"])
+        self.add_to_batch_checkbox.setChecked(False)
+
+    def _set_spin_value(self, spin, value):
+        """Set a numeric GUI value only when present in queued snapshot."""
+        if value is None:
+            return
+        spin.setValue(max(spin.minimum(), min(spin.maximum(), value)))
+
+    def _set_combo_data(self, combo, value):
+        """Select combo by stored data value, then by visible text fallback."""
+        if value is None:
+            return
+        index = combo.findData(value)
+        if index < 0:
+            index = combo.findText(str(value))
+        if index >= 0:
+            combo.setCurrentIndex(index)
+
+    def _restore_quality_params(self, quality):
+        """Restore Main-tab quality, ASR, and export controls from job snapshot."""
+        self.regeneration_enabled_checkbox.setChecked(bool(quality.get("regeneration_enabled")))
+        self._set_spin_value(self.quality_threshold_spin, quality.get("quality_threshold"))
+        self._set_spin_value(self.max_attempts_spin, quality.get("max_attempts"))
+        self.sentiment_smoothing_checkbox.setChecked(bool(quality.get("sentiment_smoothing")))
+        self._set_spin_value(self.smoothing_window_spin, quality.get("smoothing_window"))
+        self._set_combo_data(self.smoothing_method_combo, quality.get("smoothing_method"))
+        self.mfcc_validation_checkbox.setChecked(bool(quality.get("mfcc_validation")))
+        self._set_spin_value(self.spectral_threshold_spin, quality.get("spectral_threshold"))
+        self.output_validation_checkbox.setChecked(bool(quality.get("output_validation")))
+        self._set_spin_value(self.output_threshold_spin, quality.get("output_threshold"))
+        self._set_asr_backend_combo(self.asr_stage1_backend_combo, quality.get("asr_stage1_backend"))
+        self._on_stage1_backend_changed()
+        self._set_combo_data(self.asr_stage1_combo, quality.get("asr_stage1_model"))
+        self._set_asr_backend_combo(self.asr_stage2_backend_combo, quality.get("asr_stage2_backend"))
+        self._set_stage2_combo(quality.get("asr_stage2_model"))
+        self._on_stage2_model_changed()
+        self.write_m4b_check.setChecked(bool(quality.get("write_m4b")))
+        self.write_mp3_check.setChecked(bool(quality.get("write_mp3")))
+        self.write_wav_check.setChecked(bool(quality.get("write_wav")))
+        self.chapterize_check.setChecked(bool(quality.get("chapterize")))
+        self._set_combo_data(self.chapter_mode_combo, quality.get("chapter_mode"))
+        self._set_spin_value(self.chapter_minutes_spin, quality.get("max_chapter_minutes"))
+        self._update_chapter_export_controls()
+
+    def _restore_runtime_settings(self, values):
+        """Restore Config-tab values using inverse effective-settings mapping."""
+        runtime_keys = {
+            "max_workers": "MAX_WORKERS",
+            "batch_size": "BATCH_SIZE",
+            "tts_batch_size": "TTS_BATCH_SIZE",
+            "min_chunk_words": "MIN_CHUNK_WORDS",
+            "max_chunk_words": "MAX_CHUNK_WORDS",
+            "enable_mid_drop_check": "ENABLE_MID_DROP_CHECK",
+            "enable_hum_detection": "ENABLE_HUM_DETECTION",
+            "enable_normalization": "ENABLE_NORMALIZATION",
+            "normalization_type": "NORMALIZATION_TYPE",
+            "target_lufs": "TARGET_LUFS",
+            "target_peak_db": "TARGET_PEAK_DB",
+            "m4b_sample_rate": "M4B_SAMPLE_RATE",
+            "enable_audio_trimming": "ENABLE_AUDIO_TRIMMING",
+            "speech_threshold": "SPEECH_ENDPOINT_THRESHOLD",
+            "trimming_buffer": "TRIMMING_BUFFER_MS",
+            "playback_speed": "ATEMPO_SPEED",
+            "enable_micro_batching": "ENABLE_MICRO_BATCHING",
+            "silence_chapter_start": "SILENCE_CHAPTER_START",
+            "silence_chapter_end": "SILENCE_CHAPTER_END",
+            "silence_section": "SILENCE_SECTION_BREAK",
+            "silence_paragraph": "SILENCE_PARAGRAPH_END",
+            "silence_comma": "SILENCE_COMMA",
+            "silence_period": "SILENCE_PERIOD",
+            "silence_question": "SILENCE_QUESTION_MARK",
+            "silence_exclamation": "SILENCE_EXCLAMATION",
+            "enable_chunk_silence": "ENABLE_CHUNK_END_SILENCE",
+            "chunk_silence_duration": "CHUNK_END_SILENCE_MS",
+            "vader_exag_sensitivity": "VADER_EXAGGERATION_SENSITIVITY",
+            "vader_cfg_sensitivity": "VADER_CFG_WEIGHT_SENSITIVITY",
+            "vader_temp_sensitivity": "VADER_TEMPERATURE_SENSITIVITY",
+            "enable_punctuation_pauses": "ENABLE_PUNCTUATION_PAUSES",
+        }
+        for runtime_key, config_key in runtime_keys.items():
+            if runtime_key not in values:
+                continue
+            for widget in self.findChildren(QWidget):
+                if widget.property("config_key") != config_key:
+                    continue
+                value = values[runtime_key]
+                if isinstance(widget, QCheckBox):
+                    widget.setChecked(bool(value))
+                elif isinstance(widget, (QSpinBox, QDoubleSpinBox)):
+                    self._set_spin_value(widget, value)
+                elif isinstance(widget, QComboBox):
+                    self._set_combo_data(widget, value)
+        if "m4b_sample_rate" in values:
+            self.main_m4b_sample_rate_combo.setCurrentText(str(values["m4b_sample_rate"]))
+        if "chunking_mode" in values:
+            self._set_combo_data(self.chunking_mode_combo, values["chunking_mode"])
+            self._update_chunking_mode_controls()
 
     def run_book_conversion(
         self,
@@ -3861,6 +4774,7 @@ class ChatterboxMainWindow(QMainWindow):
 
             # Detect voice for this book
             self.detect_and_update_voice_info()
+            self._refresh_repair_fail_reports()
 
         except Exception as e:
             self.log_output(f"Error loading chunks: {e}")
@@ -3982,6 +4896,116 @@ class ChatterboxMainWindow(QMainWindow):
             self.detect_and_update_voice_info()
         else:
             self.log_output("No book selected - cannot refresh voice candidates")
+
+    def _repair_tts_dir(self):
+        """Return the selected book's TTS directory, or None if not loaded."""
+        if self.current_repair_audio_dir:
+            return Path(self.current_repair_audio_dir).parent
+        return None
+
+    def _refresh_repair_fail_reports(self) -> None:
+        """Fill the fail-report combo from JSON files in the book's TTS folder."""
+        self.repair_fail_report_combo.clear()
+        tts_dir = self._repair_tts_dir()
+        if tts_dir is None:
+            self.repair_fail_report_combo.addItem("Select a book first", None)
+            return
+        from modules.asr_stages import discover_asr_failure_reports
+
+        reports = discover_asr_failure_reports(tts_dir)
+        if not reports:
+            self.repair_fail_report_combo.addItem("No ASR failure logs in TTS/", None)
+            return
+        for path, label in reports:
+            self.repair_fail_report_combo.addItem(f"{label} ({path.name})", str(path))
+
+    def load_asr_failures_for_repair(self):
+        """Load failed chunks from the selected ASR or regeneration report."""
+        if not self.current_repair_chunks:
+            QMessageBox.warning(self, "No Chunks", "Please select a book first")
+            return
+        report_path = self.repair_fail_report_combo.currentData()
+        if not report_path:
+            QMessageBox.warning(
+                self,
+                "No Fail Report",
+                "No ASR failure log was found for this book.\n"
+                "Run a conversion with ASR enabled first.",
+            )
+            return
+        try:
+            from modules.asr_stages import parse_asr_failure_rows
+
+            rows = parse_asr_failure_rows(Path(report_path))
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Fail Report", f"Could not read {Path(report_path).name}:\n{exc}"
+            )
+            return
+        if not rows:
+            QMessageBox.information(
+                self,
+                "No Failures",
+                f"{Path(report_path).name} contains no failed chunks.",
+            )
+            return
+
+        by_index = {}
+        for chunk in self.current_repair_chunks:
+            try:
+                by_index[int(chunk.get("index"))] = chunk
+            except (TypeError, ValueError):
+                continue
+
+        self.repair_results_list.clear()
+        self.current_repair_fail_info = {}
+        loaded = 0
+        missing = []
+        for row in rows:
+            chunk_id = int(row["chunk_id"])
+            chunk = by_index.get(chunk_id)
+            if chunk is None:
+                missing.append(chunk_id)
+                continue
+            score = row.get("score", row.get("original_score", row.get("best_score")))
+            try:
+                score_txt = f"{float(score):.2f}"
+            except (TypeError, ValueError):
+                score_txt = "?"
+            preview = chunk.get("text") or row.get("text") or ""
+            if len(preview) > 60:
+                preview = preview[:60] + "..."
+            item_text = f"[{chunk_id}] ASR {score_txt}  {preview}"
+            item = QListWidgetItem(item_text)
+            item.setData(Qt.UserRole, chunk)
+            self.repair_results_list.addItem(item)
+            self.current_repair_fail_info[str(chunk_id)] = row
+            loaded += 1
+
+        label = self.repair_fail_report_combo.currentText()
+        self.log_output(f"Loaded {loaded} ASR-failed chunk(s) from {label}")
+        if missing:
+            self.log_output(
+                f"ASR report chunk ids not in JSON: {missing[:12]}"
+                + ("…" if len(missing) > 12 else "")
+            )
+        if loaded:
+            first = self.repair_results_list.item(0)
+            self.repair_results_list.setCurrentItem(first)
+            self.select_chunk_for_repair(first)
+            QTimer.singleShot(0, self._scroll_repair_view_to_bottom)
+
+    def _scroll_repair_view_to_bottom(self) -> None:
+        """Move the outer GUI viewport to Repair tab's editor controls.
+
+        The zero-delay timer lets Qt finish adding the loaded failure rows and
+        recalculating the tab height before its scrollbar maximum is read.
+        """
+        scroll_area = getattr(self, "main_scroll_area", None)
+        if scroll_area is None:
+            return
+        scroll_bar = scroll_area.verticalScrollBar()
+        scroll_bar.setValue(scroll_bar.maximum())
 
     def search_chunks_for_repair(self):
         """Search for chunks containing the specified text"""
@@ -4107,23 +5131,11 @@ class ChatterboxMainWindow(QMainWindow):
     def update_repair_chunk_display(self):
         """Update the chunk editor display with current chunk data"""
         if not self.current_repair_chunk:
-            self.repair_chunk_info.setText("No chunk selected")
             self.repair_text_edit.clear()
             return
 
         chunk = self.current_repair_chunk
-
-        # Update info display
-        sentiment_compound = chunk.get(
-            "sentiment_compound", chunk.get("sentiment_score", "N/A")
-        )
         tts_params = chunk.get("tts_params", {})
-
-        info_text = f"""Index: {chunk['index']} | Boundary: {chunk['boundary_type']} | Words: {chunk.get('word_count', 'N/A')}
-Sentiment: {sentiment_compound} | TTS: exag={tts_params.get('exaggeration', 'N/A')}, cfg={tts_params.get('cfg_weight', 'N/A')}, temp={tts_params.get('temperature', 'N/A')}
-Audio: chunk_{chunk['index']+1:05d}.wav"""
-
-        self.repair_chunk_info.setText(info_text)
 
         # Update text editor
         self.repair_text_edit.setPlainText(chunk["text"])
@@ -4132,10 +5144,17 @@ Audio: chunk_{chunk['index']+1:05d}.wav"""
         self.repair_boundary_combo.setCurrentText(chunk.get("boundary_type", "none"))
         # Sentiment spinner removed - value is preserved from original chunk
 
-        # Update TTS parameters
-        self.repair_exag_spin.setValue(tts_params.get("exaggeration", 1.0))
-        self.repair_cfg_spin.setValue(tts_params.get("cfg_weight", 0.7))
-        self.repair_temp_spin.setValue(tts_params.get("temperature", 0.7))
+        # Each selected chunk owns its own TTS settings.  Invalid or missing
+        # saved values fall back to the established Repair-tab defaults.
+        for spinner, key, default in (
+            (self.repair_exag_spin, "exaggeration", 1.0),
+            (self.repair_cfg_spin, "cfg_weight", 0.7),
+            (self.repair_temp_spin, "temperature", 0.7),
+        ):
+            try:
+                spinner.setValue(float(tts_params.get(key, default)))
+            except (TypeError, ValueError):
+                spinner.setValue(default)
 
     def save_chunk_changes(self):
         """Save changes to the current chunk"""
@@ -4773,6 +5792,43 @@ Audio: chunk_{chunk['index']+1:05d}.wav"""
             self.log_output(f"❌ Error during M4B regeneration: {e}")
             QMessageBox.critical(self, "Error", f"Error during M4B regeneration:\n{e}")
 
+    def _format_asr_run_summary(self, tts_dir: Path) -> str:
+        """Build the post-run ASR counts for the completion popup.
+
+        Args:
+            tts_dir: Book TTS folder that may contain asr_run_summary.json.
+
+        Returns:
+            Multi-line summary, or empty if ASR did not run.
+        """
+        import json as _json
+
+        path = Path(tts_dir) / "asr_run_summary.json"
+        if not path.exists():
+            return ""
+        try:
+            data = _json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return ""
+        stage1 = int(data.get("stage1_failed") or 0)
+        stage2 = int(data.get("stage2_failed") or 0)
+        leftover = int(data.get("regen_still_failed") or 0)
+        ids = data.get("still_failed_ids") or []
+        inv = data.get("investigation_dir") or ""
+        lines = [
+            f"ASR Stage 1 failures: {stage1}",
+            f"ASR Stage 2 failures: {stage2}"
+            + ("" if data.get("stage2_ran", True) else " (Stage 2 off — same as Stage 1)"),
+            f"Still failing after regen: {leftover}",
+        ]
+        if leftover and ids:
+            shown = ", ".join(f"{int(i):05d}" for i in ids[:20])
+            extra = f" (+{len(ids) - 20} more)" if len(ids) > 20 else ""
+            lines.append(f"Investigation chunks: {shown}{extra}")
+        if leftover and inv:
+            lines.append(f"Copied to: {inv}")
+        return "\n".join(lines)
+
     def on_conversion_finished(self, success, message):
         """Handle conversion completion"""
         # Re-enable the button
@@ -4824,8 +5880,13 @@ Audio: chunk_{chunk['index']+1:05d}.wav"""
                     f"⚠️ Could not find generated M4B at: {generated_m4b} or {alt_generated_m4b}"
                 )
 
+            asr_msg = self._format_asr_run_summary(audiobook_dir / "TTS")
             QMessageBox.information(
-                self, "Success", "Book conversion completed successfully!"
+                self,
+                "Conversion complete",
+                "Book conversion completed successfully.\n\n" + asr_msg
+                if asr_msg
+                else "Book conversion completed successfully!",
             )
         else:
             self.log_output(f"❌ Conversion failed: {message}")
@@ -4851,6 +5912,14 @@ Audio: chunk_{chunk['index']+1:05d}.wav"""
                     config_mod, "MAX_CHUNK_WORDS", self.max_chunk_words_spin.value()
                 )
             )
+            if hasattr(self, "chunking_mode_combo"):
+                saved_mode = str(
+                    getattr(config_mod, "CHUNKING_MODE", "word_cap") or "word_cap"
+                )
+                idx = self.chunking_mode_combo.findData(saved_mode)
+                if idx >= 0:
+                    self.chunking_mode_combo.setCurrentIndex(idx)
+                self._update_chunking_mode_controls()
 
             # Detection settings
             self.mid_drop_check.setChecked(
@@ -5188,11 +6257,23 @@ Audio: chunk_{chunk['index']+1:05d}.wav"""
                 "MAX_WORKERS": self.workers_spin.value(),
                 "MIN_CHUNK_WORDS": self.min_chunk_words_spin.value(),
                 "MAX_CHUNK_WORDS": self.max_chunk_words_spin.value(),
+                "CHUNKING_MODE": f'"{self.chunking_mode_combo.currentData() or "word_cap"}"',
                 "ENABLE_MID_DROP_CHECK": self.mid_drop_check.isChecked(),
                 "ENABLE_HUM_DETECTION": self.hum_detection_check.isChecked(),
                 "ASR_USE_GPU": self.asr_gpu_checkbox.isChecked(),
+                "DEFAULT_ASR_THRESHOLD": self.asr_threshold_spinner.value(),
                 "ENABLE_NORMALIZATION": self.normalization_check.isChecked(),
                 "NORMALIZATION_TYPE": f'"{self.normalization_type_combo.currentText()}"',
+                "WRITE_M4B": self.write_m4b_check.isChecked(),
+                "WRITE_MP3": self.write_mp3_check.isChecked(),
+                "WRITE_WAV": self.write_wav_check.isChecked(),
+                "CHAPTERIZE": self.chapterize_check.isChecked(),
+                "CHAPTER_MODE": f'"{self.chapter_mode_combo.currentData() or "headings_only"}"',
+                "MAX_CHAPTER_MINUTES": self.chapter_minutes_spin.value(),
+                "ASR_STAGE1_MODEL": f'"{self.asr_stage1_combo.currentText().strip() or "base"}"',
+                "ASR_STAGE2_MODEL": f'"{self.asr_stage2_combo.currentData() or "medium"}"',
+                "ASR_STAGE1_BACKEND": f'"{self.asr_stage1_backend_combo.currentData() or "faster_whisper"}"',
+                "ASR_STAGE2_BACKEND": f'"{self.asr_stage2_backend_combo.currentData() or "faster_whisper"}"',
                 "TARGET_LUFS": self.target_lufs_spin.value(),
                 "TARGET_PEAK_DB": self.target_peak_db_spin.value(),
                 "M4B_SAMPLE_RATE": int(self.m4b_sample_rate_combo.currentText()),
@@ -5382,6 +6463,16 @@ Audio: chunk_{chunk['index']+1:05d}.wav"""
                 self, "Playback Error", f"Error opening audio file:\n{e}"
             )
 
+    def _fit_gpu_label_height(self):
+        """Shrink the GPU overlay to the current text so unused black space is not shown.
+
+        The parent quality row is taller than six stat lines. Without a fixed height
+        the label stretches to that column and looks empty below the last metric.
+        """
+        self.gpu_label.setFixedWidth(220)
+        self.gpu_label.adjustSize()
+        self.gpu_label.setFixedHeight(self.gpu_label.sizeHint().height())
+
     def update_gpu_info(self):
         """Update GPU information display using nvidia-smi"""
         try:
@@ -5423,6 +6514,7 @@ Audio: chunk_{chunk['index']+1:05d}.wav"""
             self.gpu_label.setText("GPU: N/A")
         except Exception:
             self.gpu_label.setText("GPU: Error")
+        self._fit_gpu_label_height()
 
     def detect_and_update_device_status(self):
         """Detect and update device status in the GUI using comprehensive CUDA checking"""
@@ -5602,6 +6694,9 @@ Audio: chunk_{chunk['index']+1:05d}.wav"""
                 chunk_info=status_data.get("chunk_info"),
                 phase1_elapsed=status_data.get("phase1_elapsed"),
                 phase2_elapsed=status_data.get("phase2_elapsed"),
+                asr_stage1_elapsed=status_data.get("asr_stage1_elapsed"),
+                asr_stage2_elapsed=status_data.get("asr_stage2_elapsed"),
+                realtime_total=status_data.get("realtime_total"),
                 total_elapsed=status_data.get("total_elapsed"),
             )
 
@@ -5615,6 +6710,7 @@ Audio: chunk_{chunk['index']+1:05d}.wav"""
                 eta=status_data.get("eta"),
                 remaining=status_data.get("remaining"),
                 realtime=status_data.get("realtime"),
+                realtime_total=status_data.get("realtime_total"),
                 chunk_info=status_data.get("chunk_info"),
             )
 

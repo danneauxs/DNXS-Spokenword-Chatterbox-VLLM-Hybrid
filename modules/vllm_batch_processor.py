@@ -21,13 +21,19 @@ vllm_root = project_root / "chatterbox-vllm" / "src"
 sys.path.insert(0, str(vllm_root))
 
 from chatterbox_vllm.tts import ChatterboxTTS
+from config import config as runtime_config
 
 logger = logging.getLogger(__name__)
 
 
 def _extract_supported_params(tts_params: dict) -> dict:
-    """Extracts supported parameters from TTS parameters dictionary, excluding "cfg_weight"."""
-    return {k: v for k, v in tts_params.items() if k != "cfg_weight"}
+    """Return per-chunk sampling params, dropping book-level keys vLLM cannot vary.
+
+    cfg_weight is engine-load CFG. language_id/language are T3_LANGUAGE, not
+    VADER per-chunk fields.
+    """
+    skip = {"cfg_weight", "language_id", "language"}
+    return {k: v for k, v in tts_params.items() if k not in skip}
 
 
 def _group_chunks_by_params(chunk_metadata: list) -> dict:
@@ -134,13 +140,27 @@ class VllmBatchProcessor:
         max_model_len: int = 1000,
         max_batch_size: int = 10,
         variant: str = "english",
+        language_id: Optional[str] = None,
         vllm_kwargs: Optional[dict] = None,
     ):
-        """Initializes a VllmBatchProcessor instance with model configuration and parameters."""
+        """Initializes a VllmBatchProcessor instance with model configuration and parameters.
+
+        Args:
+            ckpt_dir: Directory passed to ChatterboxTTS.from_local for VE/S3Gen/conds.
+            target_device: CUDA device string for T3 cond pieces.
+            max_model_len: vLLM max model length.
+            max_batch_size: Hint for vLLM memory heuristic.
+            variant: "english" or "multilingual"; multilingual prepends <language_id>.
+            language_id: ISO code for multilingual T3 (default config.T3_LANGUAGE / en).
+            vllm_kwargs: Extra kwargs forwarded to ChatterboxTTS.from_local.
+        """
         self.target_device = target_device
         self.max_model_len = max_model_len
         self.max_batch_size = max_batch_size
         self.variant = variant
+        self.language_id = (
+            language_id or getattr(runtime_config, "T3_LANGUAGE", "en")
+        ).lower()
         self.vllm_kwargs = vllm_kwargs or {}
         self.ckpt_dir = str(ckpt_dir)
 
@@ -262,27 +282,38 @@ class VllmBatchProcessor:
             try:
                 turbo_like_params = batch_params.copy()
                 turbo_like_params.setdefault("exaggeration", 0.0)
+                # Book-level language comes from T3_LANGUAGE, not per-chunk VADER params.
+                turbo_like_params.pop("language_id", None)
+                turbo_like_params.pop("language", None)
 
                 # Real per-request progress from vLLM itself, relayed to progress_callback
                 # as generation happens -- not an after-the-fact estimate. Falls back to
                 # vLLM's own terminal bar when nothing is listening (e.g. CLI/debug use).
-                use_tqdm = (
-                    functools.partial(
-                        _ProgressRelay,
-                        on_update=progress_callback,
-                        base_count=segments_done_so_far,
-                        grand_total=total_segments,
+                # Turbo T3 conds are 376 tokens each. One vLLM generate() of a
+                # whole book overflows the ~8192-token encoder cache and CUDA-aborts.
+                gen_batch = 8 if self.variant == "turbo" else len(all_segments)
+                all_token_lists = []
+                for seg_i in range(0, len(all_segments), gen_batch):
+                    piece = all_segments[seg_i : seg_i + gen_batch]
+                    use_tqdm = (
+                        functools.partial(
+                            _ProgressRelay,
+                            on_update=progress_callback,
+                            base_count=segments_done_so_far + seg_i,
+                            grand_total=total_segments,
+                        )
+                        if progress_callback
+                        else True
                     )
-                    if progress_callback
-                    else True
-                )
-
-                all_token_lists = self.model.generate_speech_tokens(
-                    all_segments,
-                    cond_emb=cond_emb,
-                    use_tqdm=use_tqdm,
-                    **turbo_like_params,
-                )
+                    all_token_lists.extend(
+                        self.model.generate_speech_tokens(
+                            piece,
+                            cond_emb=cond_emb,
+                            use_tqdm=use_tqdm,
+                            language_id=self.language_id,
+                            **turbo_like_params,
+                        )
+                    )
 
                 segment_idx = 0
                 for idx, chunk in enumerate(batch_chunks):

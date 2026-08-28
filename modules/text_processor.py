@@ -31,7 +31,7 @@ across long audiobooks by preserving natural speech boundaries.
 import re
 import logging
 from pathlib import Path
-from config.config import MAX_CHUNK_WORDS, MIN_CHUNK_WORDS, YELLOW, RESET
+from config.config import MAX_CHUNK_WORDS, MIN_CHUNK_WORDS, CHUNKING_MODE, YELLOW, RESET
 from transformers import AutoTokenizer
 
 
@@ -334,7 +334,83 @@ def _is_apostrophe(text, pos):
     return False
 
 
-def sentence_chunk_text(text, max_words=MAX_CHUNK_WORDS, min_words=MIN_CHUNK_WORDS, use_tokens=False):
+def _split_paragraph_into_sentences(paragraph: str) -> list[str]:
+    """Split one paragraph into sentences on . ! ? plus following space.
+
+    Args:
+        paragraph: Non-empty paragraph text.
+
+    Returns:
+        Sentence strings with their terminal punctuation attached.
+    """
+    sentences = re.split(r"([.!?])\s+", paragraph.strip())
+    reconstructed = []
+    for i in range(0, len(sentences) - 1, 2):
+        sentence = sentences[i].strip()
+        if i + 1 < len(sentences):
+            sentence += sentences[i + 1]
+        if sentence:
+            reconstructed.append(sentence)
+    if sentences and sentences[-1].strip():
+        last_part = sentences[-1].strip()
+        if last_part and last_part not in ".!?":
+            reconstructed.append(last_part)
+    return reconstructed
+
+
+def _is_chapter_header_paragraph(paragraph: str) -> bool:
+    """Return True for a short Chapter/Part/Section heading paragraph."""
+    para_lower = paragraph.lower().strip()
+    return (
+        any(
+            word in para_lower
+            for word in ["chapter", "section", "part", "prologue", "epilogue"]
+        )
+        and len(paragraph.split()) <= 10
+    )
+
+
+def _pack_sentences_to_min(
+    sentences: list[str], min_words: int
+) -> list[tuple[str, bool]]:
+    """Pack full sentences until min_words, never cutting a sentence.
+
+    The last sentence in a pack may overshoot min_words. Leftover under min
+    at the paragraph end is still emitted (same as Pocket sentence mode).
+
+    Args:
+        sentences: Ordered sentences for one paragraph.
+        min_words: Soft floor; flush after adding a sentence that reaches it.
+
+    Returns:
+        List of (chunk_text, is_last_in_paragraph) tuples.
+    """
+    packed = []
+    current: list[str] = []
+    current_words = 0
+    for sent_idx, sentence in enumerate(sentences):
+        text = sentence.strip()
+        if not text:
+            continue
+        current.append(text)
+        current_words += len(text.split())
+        is_last = sent_idx == len(sentences) - 1
+        if current_words >= min_words or is_last:
+            packed.append((" ".join(current), is_last))
+            current = []
+            current_words = 0
+    if current:
+        packed.append((" ".join(current), True))
+    return packed
+
+
+def sentence_chunk_text(
+    text,
+    max_words=MAX_CHUNK_WORDS,
+    min_words=MIN_CHUNK_WORDS,
+    use_tokens=False,
+    mode=None,
+):
     """
     CRITICAL CHUNKING ALGORITHM - Heart of the TTS preprocessing system
     ================================================================
@@ -370,20 +446,23 @@ def sentence_chunk_text(text, max_words=MAX_CHUNK_WORDS, min_words=MIN_CHUNK_WOR
     - Reduces TTS model confusion from incomplete thoughts
     - Essential for long-form audiobook quality
 
-    PARAMETERS:
-    - text: Raw input text to be chunked
-    - max_words: Target maximum words per chunk (flexible for complete sentences)
-    - min_words: Minimum words per chunk (enforced by combining)
+    Args:
+        text: Raw input text to be chunked.
+        max_words: Word-cap mode maximum; ignored in sentence_pack.
+        min_words: Soft floor for combining short sentences.
+        use_tokens: If True, use token_chunk_text instead.
+        mode: ``word_cap`` (default) or ``sentence_pack``. None reads config.
 
-    RETURNS:
-    - List of (chunk_text, is_paragraph_end) tuples for TTS processing
+    Returns:
+        List of (chunk_text, is_paragraph_end) tuples for TTS processing.
     """
-    import re
-
     if use_tokens:
         return token_chunk_text(text, max_words)
 
-    # Process text paragraph by paragraph to preserve structure
+    resolved_mode = str(mode or CHUNKING_MODE or "word_cap").strip().lower()
+    if resolved_mode not in {"word_cap", "sentence_pack"}:
+        resolved_mode = "word_cap"
+
     paragraphs = text.split("\n\n")
     all_final_chunks = []
 
@@ -392,64 +471,34 @@ def sentence_chunk_text(text, max_words=MAX_CHUNK_WORDS, min_words=MIN_CHUNK_WOR
         if not paragraph:
             continue
 
-        # Check if this is a chapter/section header
-        para_lower = paragraph.lower().strip()
-        is_chapter_header = (
-            any(
-                word in para_lower
-                for word in ["chapter", "section", "part", "prologue", "epilogue"]
-            )
-            and len(paragraph.split()) <= 10
-        )
-
-        if is_chapter_header:
-            # Chapter headers are their own chunks and always paragraph ends
+        if _is_chapter_header_paragraph(paragraph):
             all_final_chunks.append((paragraph, True))
             continue
 
-        # Split into sentences using periods, exclamation marks, question marks
-        # This avoids the complex quote detection that was causing problems
-        sentences = re.split(r"([.!?])\s+", paragraph.strip())
+        reconstructed_sentences = _split_paragraph_into_sentences(paragraph)
 
-        # Reconstruct sentences with their punctuation
-        reconstructed_sentences = []
-        for i in range(0, len(sentences) - 1, 2):
-            sentence = sentences[i].strip()
-            if i + 1 < len(sentences):
-                punct = sentences[i + 1]
-                sentence += punct
-            if sentence:
-                reconstructed_sentences.append(sentence)
+        if resolved_mode == "sentence_pack":
+            all_final_chunks.extend(
+                _pack_sentences_to_min(reconstructed_sentences, min_words)
+            )
+            continue
 
-        # Handle any remaining text (no ending punctuation)
-        if sentences and sentences[-1].strip():
-            last_part = sentences[-1].strip()
-            if last_part and last_part not in ".!?":
-                reconstructed_sentences.append(last_part)
-
-        # Process each sentence
         paragraph_chunks = []
         for sent_idx, sentence in enumerate(reconstructed_sentences):
             is_last_sentence = sent_idx == len(reconstructed_sentences) - 1
             words = sentence.split()
-
             if len(words) <= max_words:
-                # Sentence fits, use as-is
                 paragraph_chunks.append((sentence.strip(), is_last_sentence))
             else:
-                # Sentence too long, break it using punctuation
                 broken_chunks = _break_long_sentence_simple(sentence, max_words)
-                # Only mark the last broken chunk as sentence end
                 for i, chunk in enumerate(broken_chunks):
                     is_chunk_end = is_last_sentence and i == len(broken_chunks) - 1
                     paragraph_chunks.append((chunk.strip(), is_chunk_end))
-
         all_final_chunks.extend(paragraph_chunks)
 
-    # Combine small chunks that don't meet min_words requirement
-    combined_chunks = _combine_small_chunks(all_final_chunks, min_words, max_words)
-
-    return combined_chunks
+    if resolved_mode == "sentence_pack":
+        return all_final_chunks
+    return _combine_small_chunks(all_final_chunks, min_words, max_words)
 
 
 def token_chunk_text(text, max_tokens=950):

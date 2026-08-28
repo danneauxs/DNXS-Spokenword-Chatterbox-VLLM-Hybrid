@@ -31,6 +31,7 @@ from .models.t3 import SPEECH_TOKEN_OFFSET
 from .models.t3.modules.cond_enc import T3Cond, T3CondEnc
 from .models.t3.modules.learned_pos_emb import LearnedPositionEmbeddings
 from .text_utils import punc_norm, SUPPORTED_LANGUAGES
+from modules.punctuation_pauses import min_speech_tokens_for_text, split_t3_sentences
 
 from config import config
 
@@ -45,6 +46,57 @@ REPO_ID = "ResembleAI/chatterbox"
 S3GEN_NUM_WORKERS = int(os.environ.get("S3GEN_NUM_WORKERS", str(config.VLLM_S3GEN_NUM_WORKERS)))
 S3GEN_ENABLE_PARALLEL = os.environ.get("S3GEN_ENABLE_PARALLEL", str(config.VLLM_S3GEN_ENABLE_PARALLEL).lower()).lower() in ("true", "1")
 SPEECH_VOCAB_SIZE = 6561  # Speech tokens must be < this value
+
+
+def resolve_t3_weight_file(ckpt_dir: str | Path, variant: str = "english") -> Path:
+    """Locate the T3 safetensors file for english or multilingual variants.
+
+    Multilingual V3 weights live outside CHATTERBOX_CKPT_DIR (VE/S3Gen stay there).
+    Prefer config.t3_weights_path() when T3_SOURCE matches `variant`; otherwise
+    look in ckpt_dir for v3 then v2 filenames so older layouts still load.
+
+    Args:
+        ckpt_dir: Directory used for VE/S3Gen or a combined checkpoint folder.
+        variant: "english" or "multilingual".
+
+    Returns:
+        Path to the T3 safetensors file.
+
+    Raises:
+        FileNotFoundError: If no matching T3 checkpoint exists.
+    """
+    ckpt_dir = Path(ckpt_dir)
+    try:
+        source = config.resolve_t3_source()
+        if config.t3_vllm_variant(source) == variant:
+            configured = config.t3_weights_path(source)
+            if configured.is_file():
+                return configured
+    except Exception:
+        # Config resolver is best-effort; fall through to ckpt_dir filenames.
+        pass
+
+    if variant == "turbo":
+        turbo_path = config.t3_weights_path("turbo")
+        if turbo_path.is_file():
+            return turbo_path
+        raise FileNotFoundError(f"Turbo T3 checkpoint not found: {turbo_path}")
+
+    if variant == "english":
+        english_path = ckpt_dir / "t3_cfg.safetensors"
+        if english_path.is_file():
+            return english_path
+        raise FileNotFoundError(f"English T3 checkpoint not found: {english_path}")
+
+    for name in ("t3_mtl23ls_v3.safetensors", "t3_mtl23ls_v2.safetensors"):
+        candidate = ckpt_dir / name
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(
+        f"Multilingual T3 checkpoint not found in {ckpt_dir} "
+        "(looked for t3_mtl23ls_v3.safetensors and t3_mtl23ls_v2.safetensors). "
+        "Set CHATTERBOX_T3_SOURCE/CHATTERBOX_MTL_CKPT_DIR or download V3 T3."
+    )
 
 @dataclass
 class Conditionals:
@@ -95,7 +147,7 @@ def compute_conditionals(
     Phase 1 (vLLM T3) never has to coexist with VE/S3Gen in VRAM.
 
     Args:
-        ckpt_dir: Model checkpoint directory.
+        ckpt_dir: Directory with VE, S3Gen, and conds.pt (usually models/chatterbox).
         target_device: Device for computation.
         variant: Model variant ("english" or "multilingual").
         audio_prompt_path: Optional voice prompt WAV path.
@@ -105,11 +157,18 @@ def compute_conditionals(
     """
     ckpt_dir = Path(ckpt_dir)
 
-    # Load T3 cond components (shared between default and voice-prompt paths)
+    # Load T3 cond components (shared between default and voice-prompt paths).
+    # T3 weights may live in a separate multilingual dir; VE/S3Gen stay in ckpt_dir.
     t3_config = T3Config()
-    t3_weights = load_file(
-        ckpt_dir / ("t3_cfg.safetensors" if variant == "english" else "t3_mtl23ls_v2.safetensors")
-    )
+    turbo = variant == "turbo"
+    if turbo:
+        t3_config.speech_tokens_dict_size = 6563
+        t3_config.speech_cond_prompt_len = 375
+        t3_config.use_perceiver_resampler = False
+        t3_config.emotion_adv = False
+    t3_ckpt_path = resolve_t3_weight_file(ckpt_dir, variant)
+    logging.info("Phase 0 loading T3 cond weights from %s", t3_ckpt_path)
+    t3_weights = load_file(t3_ckpt_path)
 
     t3_speech_emb = torch.nn.Embedding(t3_config.speech_tokens_dict_size, t3_config.n_channels)
     t3_speech_emb.load_state_dict({
@@ -119,27 +178,30 @@ def compute_conditionals(
     })
     t3_speech_emb = t3_speech_emb.to(device=target_device).eval()
 
-    t3_speech_pos_emb = LearnedPositionEmbeddings(
-        t3_config.max_speech_tokens + 2 + 2, t3_config.n_channels
-    )
-    t3_speech_pos_emb.load_state_dict({
-        k.replace('speech_pos_emb.', ''): v
-        for k, v in t3_weights.items()
-        if k.startswith('speech_pos_emb.')
-    })
-    t3_speech_pos_emb = t3_speech_pos_emb.to(device=target_device).eval()
+    t3_speech_pos_emb = None
+    if not turbo:
+        t3_speech_pos_emb = LearnedPositionEmbeddings(
+            t3_config.max_speech_tokens + 2 + 2, t3_config.n_channels
+        )
+        t3_speech_pos_emb.load_state_dict({
+            k.replace('speech_pos_emb.', ''): v
+            for k, v in t3_weights.items()
+            if k.startswith('speech_pos_emb.')
+        })
+        t3_speech_pos_emb = t3_speech_pos_emb.to(device=target_device).eval()
 
     t3_cond_enc = T3CondEnc(t3_config)
     t3_cond_enc.load_state_dict({
         k.replace('cond_enc.', ''): v
         for k, v in t3_weights.items()
         if k.startswith('cond_enc.')
-    })
+    }, strict=False)
     t3_cond_enc = t3_cond_enc.to(device=target_device).eval()
 
     # Load VE + S3Gen + conds for conditional computation
     ve = VoiceEncoder()
-    ve.load_state_dict(load_file(ckpt_dir / "ve.safetensors"))
+    ve_path = Path(config.t3_checkpoint_dir("turbo")) / "ve.safetensors" if turbo else ckpt_dir / "ve.safetensors"
+    ve.load_state_dict(load_file(ve_path))
     ve = ve.to(device=target_device).eval()
 
     s3gen = S3Gen(use_fp16=False)
@@ -160,10 +222,11 @@ def compute_conditionals(
                 s3gen_ref_wav, orig_sr=S3GEN_SR, target_sr=S3_SR
             )
 
-            # Crop to the same 6s window get_audio_conditionals uses (ENC_COND_LEN)
+            # English/MTL use 6s; Turbo T3 was trained with a 15s speech cond prompt.
+            enc_len = 15 * S3_SR if turbo else ChatterboxTTS.ENC_COND_LEN
             s3_tokzr = s3gen.tokenizer
             t3_cond_prompt_tokens, _ = s3_tokzr.forward(
-                [ref_16k_wav[:ChatterboxTTS.ENC_COND_LEN]],
+                [ref_16k_wav[:enc_len]],
                 max_len=t3_config.speech_cond_prompt_len,
             )
             t3_cond_prompt_tokens = torch.atleast_2d(t3_cond_prompt_tokens)
@@ -173,10 +236,23 @@ def compute_conditionals(
             )
             ve_embed = ve_embed.mean(axis=0, keepdim=True)
 
-        cond_prompt_speech_emb = (
-            t3_speech_emb(t3_cond_prompt_tokens)[0]
-            + t3_speech_pos_emb(t3_cond_prompt_tokens)
-        )
+        t3_cond_prompt_tokens = t3_cond_prompt_tokens.to(device=target_device)
+        cond_prompt_speech_emb = t3_speech_emb(t3_cond_prompt_tokens)[0]
+        if t3_speech_pos_emb is not None:
+            cond_prompt_speech_emb = cond_prompt_speech_emb + t3_speech_pos_emb(
+                t3_cond_prompt_tokens
+            )
+        need = int(t3_config.speech_cond_prompt_len)
+        if cond_prompt_speech_emb.shape[0] < need:
+            pad = torch.zeros(
+                need - cond_prompt_speech_emb.shape[0],
+                cond_prompt_speech_emb.shape[-1],
+                device=cond_prompt_speech_emb.device,
+                dtype=cond_prompt_speech_emb.dtype,
+            )
+            cond_prompt_speech_emb = torch.cat([cond_prompt_speech_emb, pad], dim=0)
+        elif cond_prompt_speech_emb.shape[0] > need:
+            cond_prompt_speech_emb = cond_prompt_speech_emb[:need]
 
         cond_emb = t3_cond_enc(
             T3Cond(
@@ -319,26 +395,35 @@ class ChatterboxTTS:
         ckpt_dir = Path(ckpt_dir)
 
         t3_config = T3Config()
+        if variant == "turbo":
+            t3_config.speech_tokens_dict_size = 6563
+            t3_config.speech_cond_prompt_len = 375
+            t3_config.use_perceiver_resampler = False
+            t3_config.emotion_adv = False
 
         # Load *just* the necessary weights to perform inference with T3CondEnc
-        t3_weights = load_file(ckpt_dir / ("t3_cfg.safetensors" if variant == "english" else "t3_mtl23ls_v2.safetensors"))
+        t3_ckpt_path = resolve_t3_weight_file(ckpt_dir, variant)
+        print(f"[vLLM] Loading T3 cond weights from {t3_ckpt_path}")
+        t3_weights = load_file(t3_ckpt_path)
 
         t3_enc = T3CondEnc(t3_config)
-        t3_enc.load_state_dict({ k.replace('cond_enc.', ''):v for k,v in t3_weights.items() if k.startswith('cond_enc.') })
+        t3_enc.load_state_dict({ k.replace('cond_enc.', ''):v for k,v in t3_weights.items() if k.startswith('cond_enc.') }, strict=False)
         t3_enc = t3_enc.to(device=target_device).eval()
 
         t3_speech_emb = torch.nn.Embedding(t3_config.speech_tokens_dict_size, t3_config.n_channels)
         t3_speech_emb.load_state_dict({ k.replace('speech_emb.', ''):v for k,v in t3_weights.items() if k.startswith('speech_emb.') })
         t3_speech_emb = t3_speech_emb.to(device=target_device).eval()
 
-        t3_speech_pos_emb = LearnedPositionEmbeddings(t3_config.max_speech_tokens + 2 + 2, t3_config.n_channels)
-        t3_speech_pos_emb.load_state_dict({ k.replace('speech_pos_emb.', ''):v for k,v in t3_weights.items() if k.startswith('speech_pos_emb.') })
-        t3_speech_pos_emb = t3_speech_pos_emb.to(device=target_device).eval()
+        if variant == "turbo":
+            t3_speech_pos_emb = None
+        else:
+            t3_speech_pos_emb = LearnedPositionEmbeddings(t3_config.max_speech_tokens + 2 + 2, t3_config.n_channels)
+            t3_speech_pos_emb.load_state_dict({ k.replace('speech_pos_emb.', ''):v for k,v in t3_weights.items() if k.startswith('speech_pos_emb.') })
+            t3_speech_pos_emb = t3_speech_pos_emb.to(device=target_device).eval()
 
         # File-size-based VRAM heuristic for vLLM gpu_memory_utilization.
-        # Measure t3_cfg.safetensors on disk; bf16 on GPU is ~half of fp32 on disk.
+        # Measure the resolved T3 safetensors on disk; bf16 on GPU is ~half of fp32 on disk.
         # Deliberately avoids torch.cuda.memory_allocated() for deterministic behavior.
-        t3_ckpt_path = ckpt_dir / ("t3_cfg.safetensors" if variant == "english" else "t3_mtl23ls_v2.safetensors")
         model_gb = t3_ckpt_path.stat().st_size / (1024**3) * 0.5
         # System reserve + activation overhead (larger when S3Gen/VE share the card)
         reserve_gb = 0.5 + (0.0 if load_t3_only else 1.5)
@@ -362,8 +447,11 @@ class ChatterboxTTS:
         # (vLLM loads every safetensors file in the dir as a shard).
         project_root = Path(__file__).resolve().parents[2]
         dir_name = "t3-model" if variant == "english" else "t3-model-multilingual"
-        override = (config.VLLM_ENGLISH_CKPT_DIR if variant == "english"
-                    else config.VLLM_MULTILINGUAL_CKPT_DIR)
+        try:
+            override = config.vllm_t3_model_dir()
+        except Exception:
+            override = (config.VLLM_ENGLISH_CKPT_DIR if variant == "english"
+                        else config.VLLM_MULTILINGUAL_CKPT_DIR)
         candidates = ([Path(override)] if override else []) + [
             project_root / "chatterbox-vllm" / dir_name,
             project_root / dir_name,
@@ -376,15 +464,27 @@ class ChatterboxTTS:
         )
         print(f"[vLLM] Using model dir: {t3_model_dir}")
 
+        if variant == "english":
+            tok_name = "EnTokenizer"
+        elif variant == "turbo":
+            tok_name = "TurboTokenizer"
+        else:
+            tok_name = "MtlTokenizer"
         base_vllm_kwargs = {
             "model": str(t3_model_dir),
             "task": "generate",
-            "tokenizer": "EnTokenizer" if variant == "english" else "MtlTokenizer",
+            "tokenizer": tok_name,
             "tokenizer_mode": "custom",
             "gpu_memory_utilization": vllm_memory_percent,
             "enforce_eager": not compile,
             "max_model_len": max_model_len,
         }
+        # Turbo cond embeddings are 376 tokens. vLLM's encoder cache is ~8192
+        # tokens, so ~21 Turbo prompts fit. A full-book generate() overflows
+        # that cache, splits prefill, and CUDA-asserts in speech_emb.
+        if variant == "turbo":
+            base_vllm_kwargs["max_num_seqs"] = 8
+            base_vllm_kwargs["enable_chunked_prefill"] = False
 
         # Verified engine config (2026-07-08): V1 engine, in-process. The EngineCore
         # subprocess of the default multiprocessing mode cannot see our custom
@@ -450,11 +550,14 @@ class ChatterboxTTS:
                                     revision: str = "05e904af2b5c7f8e482687a9d7336c5c824467d9",
                                     *args, **kwargs) -> 'ChatterboxTTS':
         """Loads multilingual model components from Hugging Face repository."""
-        for fpath in ["ve.safetensors", "t3_mtl23ls_v2.safetensors", "s3gen.safetensors", "grapheme_mtl_merged_expanded_v1.json", "conds.pt", "Cangjie5_TC.json"]:
+        t3_name = config.t3_weights_filename()
+        if not t3_name.startswith("t3_mtl"):
+            t3_name = "t3_mtl23ls_v3.safetensors"
+        for fpath in ["ve.safetensors", t3_name, "s3gen.safetensors", "grapheme_mtl_merged_expanded_v1.json", "conds.pt", "Cangjie5_TC.json"]:
             local_path = hf_hub_download(repo_id=repo_id, filename=fpath, revision=revision)
 
         # Ensure the symlink in './t3-model-multilingual/model.safetensors' points to t3_cfg_path
-        t3_cfg_path = Path(local_path).parent / "t3_mtl23ls_v2.safetensors"
+        t3_cfg_path = Path(local_path).parent / t3_name
         model_safetensors_path = Path.cwd() / "t3-model-multilingual" / "model.safetensors"
         model_safetensors_path.unlink(missing_ok=True)
         model_safetensors_path.symlink_to(t3_cfg_path)
@@ -505,7 +608,7 @@ class ChatterboxTTS:
 
     def update_exaggeration(self, cond_emb: torch.Tensor, exaggeration: float) -> torch.Tensor:
         """Adjusts condition embedding for text generation based on exaggeration factor."""
-        if exaggeration == 0.5:
+        if exaggeration == 0.5 or self.variant == "turbo":
             return cond_emb
 
         new_cond_emb = cond_emb.clone()
@@ -762,6 +865,10 @@ class ChatterboxTTS:
     ) -> List[List[int]]:
         """Generate raw speech token lists via vLLM T3 (Phase 1 of the phased pipeline).
 
+        Multi-sentence prompts are generated one sentence at a time with a
+        word-count min_tokens floor so speech-stop cannot fire at the first
+        period. Token lists are concatenated back into one list per input prompt.
+
         Args:
             prompts: Input text prompt(s).
             audio_prompt_path: Voice WAV; used only when cond_emb is not given
@@ -776,7 +883,7 @@ class ChatterboxTTS:
                 real per-request completion progress elsewhere (e.g. a GUI).
 
         Returns:
-            One list of speech token ids per prompt.
+            One list of speech token ids per original prompt (sentences concatenated).
         """
         if cond_emb is None:
             _s3gen_ref, cond_emb = self.get_audio_conditionals(audio_prompt_path)
@@ -793,16 +900,44 @@ class ChatterboxTTS:
 
         cond_emb = self.update_exaggeration(cond_emb, exaggeration)
 
-        # Norm and tokenize text
-        prompts = ["[START]" + punc_norm(p) + "[STOP]" for p in prompts]
+        sentence_groups: List[List[str]] = []
+        for prompt in prompts:
+            parts = split_t3_sentences(prompt)
+            sentence_groups.append(parts if parts else [prompt])
+        flat_source = [sentence for group in sentence_groups for sentence in group]
+
+        # Norm and tokenize text. Turbo GPT2 has no [START]/[STOP] text specials.
+        if self.variant == "turbo":
+            flat_prompts = [punc_norm(p) for p in flat_source]
+            from chatterbox_vllm.models.t3.t3_turbo import SPEECH_TOKEN_OFFSET as _off
+        else:
+            flat_prompts = ["[START]" + punc_norm(p) + "[STOP]" for p in flat_source]
+            _off = SPEECH_TOKEN_OFFSET
 
         # For multilingual, prepend the language token
         if self.variant == "multilingual":
-            prompts = [f"<{language_id.lower()}>{p}" for p in prompts]
+            flat_prompts = [f"<{language_id.lower()}>{p}" for p in flat_prompts]
 
         # Strip pipeline-level kwargs that SamplingParams would reject
-        for _key in ('diffusion_steps', 'cfg_weight', 'language'):
+        for _key in ('diffusion_steps', 'cfg_weight', 'language', 'min_tokens'):
             kwargs.pop(_key, None)
+
+        capped_max = min(max_tokens, self.max_model_len)
+        stop_ids = [self.t3_config.stop_speech_token + _off]
+        sampling_params = [
+            SamplingParams(
+                temperature=temperature,
+                stop_token_ids=stop_ids,
+                max_tokens=capped_max,
+                min_tokens=min_speech_tokens_for_text(source, capped_max),
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                detokenize=self.variant != "turbo",
+                *args,
+                **kwargs,
+            )
+            for source in flat_source
+        ]
 
         with torch.inference_mode():
             start_time = time.time()
@@ -814,32 +949,34 @@ class ChatterboxTTS:
                             "conditionals": [cond_emb],
                         },
                     }
-                    for text in prompts
+                    for text in flat_prompts
                 ],
-                sampling_params=SamplingParams(
-                    temperature=temperature,
-                    stop_token_ids=[self.t3_config.stop_speech_token + SPEECH_TOKEN_OFFSET],
-                    max_tokens=min(max_tokens, self.max_model_len),
-                    top_p=top_p,
-                    repetition_penalty=repetition_penalty,
-                    *args, **kwargs,
-                ),
+                sampling_params=sampling_params,
                 use_tqdm=use_tqdm,
             )
             print(f"[T3] Speech token generation time: {time.time() - start_time:.2f}s")
 
-            all_speech_tokens = []
+            flat_speech_tokens = []
             for batch_result in batch_results:
                 for output in batch_result.outputs:
                     if not output.token_ids:
-                        all_speech_tokens.append([])
+                        flat_speech_tokens.append([])
                         continue
-                    speech_tokens = torch.tensor([token - SPEECH_TOKEN_OFFSET for token in output.token_ids], device="cpu")
+                    speech_tokens = torch.tensor([token - _off for token in output.token_ids], device="cpu")
                     speech_tokens = drop_invalid_tokens(speech_tokens)
                     speech_tokens = speech_tokens[(speech_tokens >= 0) & (speech_tokens < SPEECH_VOCAB_SIZE)]
-                    all_speech_tokens.append(speech_tokens.tolist()) # Return as CPU list
+                    flat_speech_tokens.append(speech_tokens.tolist())
 
-            return all_speech_tokens
+            stitched: List[List[int]] = []
+            cursor = 0
+            for group in sentence_groups:
+                combined: List[int] = []
+                for _ in group:
+                    if cursor < len(flat_speech_tokens):
+                        combined.extend(flat_speech_tokens[cursor])
+                        cursor += 1
+                stitched.append(combined)
+            return stitched
 
     def generate_from_tokens(self, speech_tokens_list: List[List[int]], s3gen_ref: dict, cond_emb: torch.Tensor, diffusion_steps: int = 10) -> List:
         """Decode pre-generated speech tokens to waveforms with S3Gen (Phase 2 helper).
@@ -903,10 +1040,27 @@ class ChatterboxTTS:
         del t3
         del engine_core
         del llm_engine
-        for attr in ('t3', 's3gen', 've', 'default_conds'):
+        # T3CondEnc and the two speech embeddings are Phase-1 CUDA modules.
+        # They are not owned by vLLM's executor, so executor shutdown cannot
+        # release them.  Leaving these attributes alive retained about 3 GB
+        # after English T3 runs and prevented Parakeet from loading.
+        for attr in (
+            't3',
+            't3_config',
+            't3_cond_enc',
+            't3_speech_emb',
+            't3_speech_pos_emb',
+            's3gen',
+            've',
+            'default_conds',
+        ):
             if hasattr(self, attr):
                 delattr(self, attr)
+        # The cached method can retain voice conditional GPU tensors when this
+        # class was used outside T3-only Phase 1.
+        self.get_audio_conditionals.cache_clear()
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()

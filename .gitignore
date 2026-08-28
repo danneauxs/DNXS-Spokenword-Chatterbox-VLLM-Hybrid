@@ -1,2 +1,9 @@
-models/
+/models/
 *.bak
+venv/
+__pycache__/
+*.pyc
+Audiobook/
+logs/
+term.log
+*.egg-info/

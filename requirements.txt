@@ -42,6 +42,8 @@ pykakasi>=2.0.0
 
 # ASR / Validation
 faster-whisper>=0.10.0
+nemo-toolkit[asr]>=2.7.3  # Parakeet Stage 1; keep torch/vllm pinned when installing
+pywhispercpp>=1.5.0  # whisper.cpp; CPU wheel. GPU build: ASR/install_pywhispercpp_cuda.sh
 
 # ChatterboxTTS Core Dependencies
 resemble-perth>=1.0.1

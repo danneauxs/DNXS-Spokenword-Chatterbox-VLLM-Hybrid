@@ -13,7 +13,7 @@ import sys
 import numpy as np
 import warnings
 import subprocess
-from datetime import timedelta
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -49,11 +49,36 @@ def _build_chunk_meta(chunks_data: list) -> dict:
 
 
 def _resolve_asr_model_size(asr_level: str) -> str:
-    """Maps the GUI's SAFE/MODERATE/INSANE tier to a Whisper model name, using
-    the same system-profile-based recommendation the GUI's own preview text
-    already computes (modules/system_detector.py), so the daemon's actual
-    model matches what the GUI told the user it would use.
+    """Resolve Stage 1 Whisper size from an explicit model name or legacy tier.
+
+    Explicit names (tiny/base/small/medium/...) win. The old SAFE/MODERATE/
+    INSANE labels still map through system_detector so older callers work.
+
+    Args:
+        asr_level: Whisper model name or safe/moderate/insane.
+
+    Returns:
+        A faster-whisper model name, defaulting to base.
     """
+    token = str(asr_level or "").strip().lower()
+    known = {
+        "tiny",
+        "base",
+        "small",
+        "medium",
+        "large",
+        "large-v2",
+        "large-v3",
+        "large-v3-turbo",
+        "distil-small.en",
+        "distil-medium.en",
+        "distil-large-v3",
+        "parakeet",
+        "parakeet-tdt-0.6b-v3",
+        "parakeet-tdt",
+    }
+    if token in known:
+        return token
     try:
         from modules.system_detector import get_system_profile, recommend_asr_models
         recommendations = recommend_asr_models(get_system_profile())
@@ -61,34 +86,125 @@ def _resolve_asr_model_size(asr_level: str) -> str:
             "primary", {}
         ).get("model", "base")
     except Exception as e:
-        logging.warning("Could not resolve ASR model tier '%s', defaulting to base: %s", asr_level, e)
+        logging.warning("Could not resolve ASR model '%s', defaulting to base: %s", asr_level, e)
         return "base"
 
 
-def _maybe_start_asr_daemon(tts_dir, enable_asr: bool, asr_level: str = "moderate", asr_device: str = "cpu"):
-    """Starts the ASR daemon for Phase 3, or returns None if ASR/regen is off.
+def _asr_evidence(asr_result: dict, fallback_text: str = "") -> dict:
+    """Copy spoken-compare fields from a batch result into a report row.
 
-    Called BEFORE Phase 2 decode so VllmDecoder.decode_tokens can submit each
-    chunk for background transcription as soon as it's written, instead of
-    blocking decode on ASR the way the legacy per-chunk backend does.
+    Args:
+        asr_result: Dict returned by the selected batch runner.
+        fallback_text: Chunk source text if the daemon omitted expected_text.
 
-    asr_device: "cpu" (default, never contends with TTS for VRAM) or "cuda"
-        (Tab 2's "Run ASR on GPU" checkbox). The daemon itself falls back to
-        CPU on its own if a CUDA load fails, so this is safe to leave on GPU.
+    Returns:
+        JSON-safe evidence dict (transcript, diffs, explanation).
     """
-    if not (ENABLE_REGENERATION_LOOP and enable_asr):
-        return None
-    try:
-        from tools.asr_client import ASRDaemonClient
-        model_size = _resolve_asr_model_size(asr_level)
-        asr_client = ASRDaemonClient(base_dir=Path(tts_dir), model_size=model_size, device=asr_device)
-        asr_client.start_daemon()
-        print(f"✅ [ASR] Daemon loaded (model: {model_size}, device: {asr_device})")
-        return asr_client
-    except Exception as e:
-        logging.error("ASR daemon failed to start, continuing without ASR scoring: %s", e)
-        print(f"⚠️ ASR daemon failed to start: {e}")
-        return None
+    asr_result = asr_result or {}
+    return {
+        "asr_text": asr_result.get("asr_text") or asr_result.get("transcript") or "",
+        "expected_text": asr_result.get("expected_text") or fallback_text,
+        "ref_normalized": asr_result.get("ref_normalized", ""),
+        "hyp_normalized": asr_result.get("hyp_normalized", ""),
+        "missing_words": asr_result.get("missing_words") or [],
+        "extra_words": asr_result.get("extra_words") or [],
+        "backend": asr_result.get("backend") or "",
+        "failure_type": asr_result.get("failure_type") or "",
+        "coverage_score": asr_result.get("coverage_score"),
+        "phonetic_score": asr_result.get("phonetic_score"),
+        "accepted_equivalences": asr_result.get("accepted_equivalences") or [],
+        "explanation": asr_result.get("explanation")
+        or asr_result.get("error")
+        or "",
+        "error": asr_result.get("error"),
+        "device": asr_result.get("device") or "",
+    }
+
+
+def _has_scored_asr_result(asr_result: dict | None) -> bool:
+    """Return whether an ASR result contains a completed transcription score.
+
+    Transport, model-load, and transcription failures can carry a placeholder
+    score of zero. They are operational errors, not evidence that generated
+    audio failed, and must never enter Stage 2 or regeneration work.
+
+    Args:
+        asr_result: Result returned by the ASR daemon client, if any.
+
+    Returns:
+        True only for a batch result with a score and no error field.
+    """
+    return bool(asr_result) and "score" in asr_result and not asr_result.get("error")
+
+
+def _write_asr_inspection_text(path: Path, title: str, rows: list, threshold: float) -> None:
+    """Write a human-readable original-vs-heard report for failed chunks.
+
+    Args:
+        path: Destination .txt path under the book's TTS folder.
+        title: Report heading (Stage 1 or Stage 2).
+        rows: Failure dicts that include text/asr_text/explanation/score.
+        threshold: Similarity bar used for this stage.
+    """
+    fails = [
+        row
+        for row in rows
+        if not row.get("passed", False) or float(row.get("score") or 0) < threshold
+    ]
+    lines = [
+        title,
+        f"Threshold: {threshold:.2f}",
+        f"Failed chunks: {len(fails)} / {len(rows)} listed",
+        "",
+    ]
+    if not fails:
+        lines.append("No failures.")
+    for row in fails:
+        cid = row.get("chunk_id")
+        try:
+            cid_s = f"{int(cid):05d}"
+        except (TypeError, ValueError):
+            cid_s = str(cid)
+        lines.extend(
+            [
+                f"===== chunk_{cid_s}  score={float(row.get('score') or 0):.3f}  "
+                f"{row.get('classification', 'FAIL')} =====",
+                f"WHY: {row.get('explanation') or '(no explanation)'}",
+                "ORIGINAL:",
+                str(row.get("expected_text") or row.get("text") or ""),
+                "HEARD:",
+                str(row.get("asr_text") or ""),
+                "",
+            ]
+        )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _write_asr_json(path: Path, payload) -> None:
+    """Write one ASR report JSON with numpy-safe float conversion.
+
+    Args:
+        path: Destination JSON path.
+        payload: JSON-serializable list or dict.
+    """
+    import json as _json
+
+    path.write_text(
+        _json.dumps(payload, indent=2, ensure_ascii=False, default=str) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _fmt_asr_elapsed(seconds: float) -> str:
+    """Format a duration as H:MM:SS for ASR stage timers.
+
+    Args:
+        seconds: Elapsed seconds, may be zero.
+
+    Returns:
+        H:MM:SS string.
+    """
+    return str(timedelta(seconds=int(max(0.0, seconds))))
 
 
 def _run_phase3_regen(
@@ -104,53 +220,406 @@ def _run_phase3_regen(
     decoder_type: str,
     voice_path,
     turbo_ckpt_dir,
-    asr_client,
+    asr_enabled: bool,
+    asr_device: str,
     asr_threshold: float,
     true_start_time: float,
 ):
-    """Validate ASR-scored chunks and regenerate anything below asr_threshold.
+    """Run short-lived Stage 1/2 ASR batches, then batched T3/S3Gen regen.
 
-    Local VAD/MFCC heuristics alone cannot authorize regeneration. When ASR is
-    disabled or its daemon is unavailable, the normal token-to-audio pipeline
-    ends after Phase 2 and this phase is skipped.
+    Local VAD/MFCC scores are logged only. Fail/regen is authorized by ASR
+    spoken-compare. Stage 2, when not disabled, re-scores Stage 1 fails with a
+    selected independent backend after Stage 1 has released its model. T3 then
+    S3Gen still take turns for retries (never loaded together). max_attempts=0
+    is report-only.
+
+    Args:
+        chunk_meta: Per-chunk text, parameters, pause, and boundary metadata.
+        tokens_dict: Generated T3 tokens keyed by chunk id.
+        local_scores: Optional non-ASR diagnostics keyed by chunk id.
+        tts_dir: Current book's TTS directory for ASR reports and work files.
+        audio_chunks_dir: Current book's generated chunk-WAV directory.
+        cond_emb: Voice conditional embedding reused for regeneration.
+        ckpt_dir: Chatterbox checkpoint directory.
+        device: Requested TTS device for retries.
+        variant: Active T3 variant.
+        decoder_type: Selected S3Gen decoder implementation.
+        voice_path: Voice sample used by retry synthesis.
+        turbo_ckpt_dir: Turbo checkpoint directory when applicable.
+        asr_enabled: Whether the user enabled ASR for this run.
+        asr_device: Requested ASR device.
+        asr_threshold: Spoken-comparison pass threshold.
+        true_start_time: Wall-clock timestamp at conversion start.
+
+    Returns:
+        ASR stage summary dict when enabled, otherwise None.
     """
-    if not ENABLE_REGENERATION_LOOP or asr_client is None:
-        if ENABLE_REGENERATION_LOOP and asr_client is None:
-            logging.info("Phase 3 skipped: ASR is disabled or unavailable")
-            print("[Regen] Skipped: ASR is disabled or unavailable")
+    if not asr_enabled:
+        logging.info("Phase 3 skipped: ASR is disabled")
+        print("[Regen] Skipped: ASR is disabled")
         return
 
     logging.info("=" * 70)
-    logging.info("PHASE 3: ASR + quality validation / regeneration")
+    logging.info("PHASE 3: two-stage ASR / regeneration")
     logging.info("=" * 70)
-    emit_phase_status(None, "Checking chunk quality (ASR/regeneration)", total_start_time=true_start_time)
+    emit_phase_status(
+        None, "Checking chunk quality (ASR Stage 1)", total_start_time=true_start_time
+    )
 
-    from modules.regeneration_engine import compute_composite_score, regenerate_failed_chunks
+    from modules.asr_stages import (
+        PARAKEET_MODEL,
+        accepted_asr_fuzzy_reason,
+        is_parakeet_backend,
+        is_stage_two_disabled,
+        known_asr_pass_reason,
+        load_accepted_asr_fuzzies,
+        load_known_asr_passes,
+        normalize_backend,
+        normalize_model_name,
+    )
+    from modules.regeneration_engine import regenerate_failed_chunks
+    from ASR.batch_runner import ASRBatchConfig, run_asr_batch_isolated
 
-    failed = []
-    for chunk_id in tokens_dict.keys():
+    tts_dir = Path(tts_dir)
+    known_passes = load_known_asr_passes(tts_dir)
+    accepted_fuzzies = load_accepted_asr_fuzzies(tts_dir)
+    if known_passes:
+        print(f"[ASR] Loaded {len(known_passes)} text-validated manual no-fail override(s)")
+    if accepted_fuzzies:
+        print(f"[ASR] Loaded {len(accepted_fuzzies)} listener-approved fuzzy exemption(s)")
+    chunk_ids = list(tokens_dict.keys())
+    stage1_backend = normalize_backend(globals().get("ASR_STAGE1_BACKEND"))
+    stage1_model = _resolve_asr_model_size(globals().get("ASR_STAGE1_MODEL", "base"))
+    if is_parakeet_backend(stage1_backend):
+        # A saved config can retain a former Whisper name after the user switches
+        # Stage 1 to Parakeet; Parakeet must never attempt to load that Whisper id.
+        stage1_model = PARAKEET_MODEL
+    stage1_config = ASRBatchConfig(
+        backend=stage1_backend,
+        model_size=stage1_model,
+        requested_device=asr_device,
+        workers=int(globals().get("ASR_WORKERS", 4) or 4),
+    )
+    stage1_tasks = [
+        {
+            "chunk_id": str(chunk_id),
+            "wav_path": str(Path(audio_chunks_dir) / f"chunk_{int(chunk_id):05d}.wav"),
+            "expected_text": chunk_meta.get(chunk_id, {}).get("text", ""),
+            "threshold": asr_threshold,
+        }
+        for chunk_id in chunk_ids
+    ]
+    print(
+        f"[ASR] Stage 1 batch starting after S3Gen shutdown (backend={stage1_backend}, "
+        f"model={stage1_model}, requested_device={asr_device}, {len(chunk_ids)} chunks)"
+    )
+    stage1_t0 = time.time()
+    stage1_run = run_asr_batch_isolated(
+        stage1_tasks, stage1_config, tts_dir, stage_label="stage1"
+    )
+    stage1_results = stage1_run.results
+    stage1_secs = time.time() - stage1_t0
+    stage1_rows = []
+    stage1_failures = []
+    stage1_unscored = []
+    for chunk_id in chunk_ids:
         meta = chunk_meta.get(chunk_id, {})
-        asr_result = asr_client.get_result(str(chunk_id), timeout=60) if asr_client is not None else None
-        composite = compute_composite_score(local_scores.get(chunk_id), asr_result)
-        if composite < asr_threshold:
-            failed.append({
+        asr_result = stage1_results.get(str(chunk_id), {})
+        scored = _has_scored_asr_result(asr_result)
+        score = float(asr_result.get("score", 0.0) or 0.0)
+        manual_pass_reason = known_asr_pass_reason(
+            known_passes, chunk_id, meta.get("text", "")
+        )
+        accepted_fuzzy_reason = accepted_asr_fuzzy_reason(
+            accepted_fuzzies, chunk_id, meta.get("text", "")
+        )
+        manual_pass = bool(manual_pass_reason) and scored
+        accepted_fuzzy = bool(accepted_fuzzy_reason) and scored
+        regeneration_exempt = manual_pass or accepted_fuzzy
+        passed = (bool(asr_result.get("passed")) or manual_pass) and scored
+        classification = "MANUAL_PASS" if manual_pass else (
+            "ACCEPTED_FUZZY"
+            if accepted_fuzzy
+            else asr_result.get(
+                "classification", "PASS" if passed else ("FAIL" if scored else "ASR_ERROR")
+            )
+        )
+        evidence = _asr_evidence(asr_result, meta.get("text", ""))
+        row = {
+            "chunk_id": chunk_id,
+            "text": meta.get("text", ""),
+            "score": score,
+            "passed": passed,
+            "scored": scored,
+            "classification": classification,
+            "manual_pass": manual_pass,
+            "manual_pass_reason": manual_pass_reason or "",
+            "accepted_fuzzy": accepted_fuzzy,
+            "accepted_fuzzy_reason": accepted_fuzzy_reason or "",
+            "regeneration_exempt": regeneration_exempt,
+            "local_score": local_scores.get(chunk_id),
+            **evidence,
+        }
+        stage1_rows.append(row)
+        if not scored:
+            stage1_unscored.append(row)
+            print(
+                f"⚠️ [ASR] Stage 1 ERROR chunk_{int(chunk_id):05d}: "
+                f"{evidence.get('error') or 'missing result'}"
+            )
+            continue
+        if (not passed or score < asr_threshold) and not regeneration_exempt:
+            fail_row = {
                 "chunk_id": chunk_id,
                 "text": meta.get("text", ""),
                 "tts_params": meta.get("tts_params", {}),
                 "segments": meta.get("segments", []),
                 "pauses": meta.get("pauses", []),
                 "boundary_type": meta.get("boundary_type", "none"),
-                "original_score": composite,
-            })
+                "original_score": score,
+                "stage": "stage1",
+                **evidence,
+            }
+            stage1_failures.append(fail_row)
+            print(
+                f"[ASR] Stage 1 FAIL chunk_{int(chunk_id):05d} "
+                f"score={score:.2f} | {evidence.get('explanation', '')}"
+            )
+            print(f"      original: {meta.get('text', '')[:160]}")
+            print(f"      heard:    {(evidence.get('asr_text') or '')[:160]}")
+        elif regeneration_exempt:
+            decision = "MANUAL PASS" if manual_pass else "ACCEPTED FUZZY"
+            reason = manual_pass_reason if manual_pass else accepted_fuzzy_reason
+            print(
+                f"[ASR] Stage 1 {decision} chunk_{int(chunk_id):05d} ({reason})"
+            )
 
-    logging.info(
-        "Phase 3: %d/%d chunks below threshold (%.2f)", len(failed), len(tokens_dict), asr_threshold
+    stage1_devices = list(stage1_run.actual_devices)
+
+    _write_asr_json(tts_dir / "asr_stage1.json", stage1_rows)
+    _write_asr_json(tts_dir / "asr_stage1_failures.json", stage1_failures)
+    _write_asr_inspection_text(
+        tts_dir / "asr_stage1_report.txt",
+        "ASR Stage 1 inspection",
+        stage1_rows,
+        asr_threshold,
     )
-    print(f"[Regen] Quality check: {len(failed)}/{len(tokens_dict)} chunks below threshold {asr_threshold:.2f}")
+    logging.info(
+        "Stage 1: %d/%d scored chunks below threshold (%.2f); %d unscored",
+        len(stage1_failures),
+        len(chunk_ids) - len(stage1_unscored),
+        asr_threshold,
+        len(stage1_unscored),
+    )
+    stage1_scored = len(chunk_ids) - len(stage1_unscored)
+    stage1_rate = (stage1_scored / stage1_secs) if stage1_secs > 0 else 0.0
+    print(
+        f"[ASR] Stage 1: {len(stage1_failures)}/{stage1_scored} scored below "
+        f"{asr_threshold:.2f}  time={_fmt_asr_elapsed(stage1_secs)}  "
+        f"{stage1_rate:.2f} chunks/s  unscored={len(stage1_unscored)}  "
+        f"({stage1_backend}/{stage1_model}, "
+        f"actual_device={','.join(stage1_devices) or 'unknown'}, "
+        f"effective_workers={stage1_run.effective_workers})"
+    )
+    emit_phase_status(
+        None,
+        "ASR Stage 1 done",
+        total_start_time=true_start_time,
+        extra={"asr_stage1_elapsed": _fmt_asr_elapsed(stage1_secs)},
+    )
 
-    if failed:
-        regenerate_failed_chunks(
-            failed=failed,
+    stage2_model = normalize_model_name(globals().get("ASR_STAGE2_MODEL", "medium"))
+    stage2_backend = normalize_backend(globals().get("ASR_STAGE2_BACKEND", "faster_whisper"))
+    confirmed = list(stage1_failures)
+    stage2_secs = 0.0
+    stage2_load_secs = 0.0
+    stage2_score_secs = 0.0
+    stage2_devices: list[str] = []
+    stage2_unscored = []
+    stage2_run = None
+    stage2_config = None
+    if (not is_stage_two_disabled(stage2_model)) and stage1_failures:
+        emit_phase_status(
+            None,
+            f"ASR Stage 2 ({stage2_backend}/{stage2_model}) on {len(stage1_failures)} fail(s)",
+            total_start_time=true_start_time,
+            extra={"asr_stage1_elapsed": _fmt_asr_elapsed(stage1_secs)},
+        )
+        try:
+            stage2_t0 = time.time()
+            stage2_config = ASRBatchConfig(
+                backend=stage2_backend,
+                model_size=stage2_model,
+                requested_device=asr_device,
+                workers=int(globals().get("ASR_WORKERS", 4) or 4),
+            )
+            print(
+                f"[ASR] Stage 2 batch starting after Stage 1 release "
+                f"(backend={stage2_backend}, model={stage2_model}, "
+                f"requested_device={asr_device}, candidates={len(stage1_failures)})"
+            )
+            score_t0 = time.time()
+            stage2_run = run_asr_batch_isolated(
+                [
+                    {
+                        "chunk_id": str(item["chunk_id"]),
+                        "wav_path": str(
+                            Path(audio_chunks_dir)
+                            / f"chunk_{int(item['chunk_id']):05d}.wav"
+                        ),
+                        "expected_text": item["text"],
+                        "threshold": asr_threshold,
+                    }
+                    for item in stage1_failures
+                ],
+                stage2_config,
+                tts_dir,
+                stage_label="stage2",
+            )
+            stage2_results = stage2_run.results
+            stage2_score_secs = time.time() - score_t0
+            stage2_secs = time.time() - stage2_t0
+            stage2_load_secs = stage2_run.load_seconds
+            stage2_rows = []
+            confirmed = []
+            for item in stage1_failures:
+                cid = item["chunk_id"]
+                asr_result = stage2_results.get(str(cid), {})
+                scored = _has_scored_asr_result(asr_result)
+                score = float(asr_result.get("score", 0.0) or 0.0)
+                manual_pass_reason = known_asr_pass_reason(
+                    known_passes, cid, item.get("text", "")
+                )
+                accepted_fuzzy_reason = accepted_asr_fuzzy_reason(
+                    accepted_fuzzies, cid, item.get("text", "")
+                )
+                manual_pass = bool(manual_pass_reason) and scored
+                accepted_fuzzy = bool(accepted_fuzzy_reason) and scored
+                regeneration_exempt = manual_pass or accepted_fuzzy
+                passed = (bool(asr_result.get("passed")) or manual_pass) and scored
+                classification = "MANUAL_PASS" if manual_pass else (
+                    "ACCEPTED_FUZZY"
+                    if accepted_fuzzy
+                    else asr_result.get(
+                        "classification", "PASS" if passed else ("FAIL" if scored else "ASR_ERROR")
+                    )
+                )
+                evidence = _asr_evidence(asr_result, item.get("text", ""))
+                row = {
+                    "chunk_id": cid,
+                    "text": item["text"],
+                    "stage1_score": item["original_score"],
+                    "score": score,
+                    "passed": passed,
+                    "scored": scored,
+                    "classification": classification,
+                    "manual_pass": manual_pass,
+                    "manual_pass_reason": manual_pass_reason or "",
+                    "accepted_fuzzy": accepted_fuzzy,
+                    "accepted_fuzzy_reason": accepted_fuzzy_reason or "",
+                    "regeneration_exempt": regeneration_exempt,
+                    **evidence,
+                }
+                stage2_rows.append(row)
+                if not scored:
+                    stage2_unscored.append(row)
+                    print(
+                        f"⚠️ [ASR] Stage 2 ERROR chunk_{int(cid):05d}: "
+                        f"{evidence.get('error') or 'missing result'}"
+                    )
+                    continue
+                if (not passed or score < asr_threshold) and not regeneration_exempt:
+                    retry = dict(item)
+                    retry["original_score"] = score
+                    retry["stage"] = "stage2"
+                    retry.update(evidence)
+                    confirmed.append(retry)
+                    print(
+                        f"[ASR] Stage 2 FAIL chunk_{int(cid):05d} "
+                        f"score={score:.2f} | {evidence.get('explanation', '')}"
+                    )
+                    print(f"      original: {item.get('text', '')[:160]}")
+                    print(f"      heard:    {(evidence.get('asr_text') or '')[:160]}")
+                else:
+                    decision = (
+                        "MANUAL PASS" if manual_pass else "ACCEPTED FUZZY" if accepted_fuzzy else "PASS"
+                    )
+                    print(
+                        f"[ASR] Stage 2 {decision} chunk_{int(cid):05d} "
+                        f"score={score:.2f} (Stage 1 was {item['original_score']:.2f})"
+                    )
+            _write_asr_json(tts_dir / "asr_stage2.json", stage2_rows)
+            stage2_devices = list(stage2_run.actual_devices)
+            _write_asr_inspection_text(
+                tts_dir / "asr_stage2_report.txt",
+                "ASR Stage 2 inspection",
+                stage2_rows,
+                asr_threshold,
+            )
+            logging.info(
+                "Stage 2: %d/%d Stage-1 fails confirmed",
+                len(confirmed),
+                len(stage1_failures),
+            )
+            stage2_scored = len(stage1_failures) - len(stage2_unscored)
+            n2 = max(1, stage2_scored)
+            score_rate = n2 / stage2_score_secs if stage2_score_secs > 0 else 0.0
+            print(
+                f"[ASR] Stage 2: {len(confirmed)}/{stage2_scored} scored confirmed fails  "
+                f"load={_fmt_asr_elapsed(stage2_load_secs)}  "
+                f"score={_fmt_asr_elapsed(stage2_score_secs)}  "
+                f"total={_fmt_asr_elapsed(stage2_secs)}  "
+                f"{score_rate:.2f} chunks/s  unscored={len(stage2_unscored)}  "
+                f"({stage2_backend}/{stage2_model}, "
+                f"actual_device={','.join(stage2_devices) or 'unknown'}, "
+                f"effective_workers={stage2_run.effective_workers})"
+            )
+            emit_phase_status(
+                None,
+                f"ASR Stage 2 done ({stage2_backend}/{stage2_model})",
+                total_start_time=true_start_time,
+                extra={
+                    "asr_stage1_elapsed": _fmt_asr_elapsed(stage1_secs),
+                    "asr_stage2_elapsed": _fmt_asr_elapsed(stage2_secs),
+                },
+            )
+        except Exception as exc:
+            confirmed = []
+            logging.error("Stage 2 ASR failed; blocking regeneration: %s", exc)
+            print(f"⚠️ Stage 2 ASR failed ({exc}); regeneration blocked")
+
+    _write_asr_json(tts_dir / "asr_confirmed_failures.json", confirmed)
+    _write_asr_inspection_text(
+        tts_dir / "asr_confirmed_report.txt",
+        "ASR confirmed failures (what regen will retry)",
+        confirmed,
+        asr_threshold,
+    )
+    print(
+        f"[Regen] Confirmed failures: {len(confirmed)}/{len(chunk_ids)} "
+        f"(threshold {asr_threshold:.2f})"
+    )
+    print(f"[ASR] Readable reports: {tts_dir / 'asr_stage1_report.txt'}")
+    if (tts_dir / "asr_stage2_report.txt").exists():
+        print(f"[ASR]                 {tts_dir / 'asr_stage2_report.txt'}")
+    print(f"[ASR]                 {tts_dir / 'asr_confirmed_report.txt'}")
+
+    # Stage runners release their model before returning.  Regeneration keeps the
+    # Stage-2 verifier when enabled; otherwise Stage 1 remains the chosen scorer.
+    score_config = stage2_config if stage2_config is not None else stage1_config
+    print("[ASR] Stage models released before regeneration so T3/S3Gen own the GPU")
+
+    do_regen = bool(ENABLE_REGENERATION_LOOP) and int(MAX_REGENERATION_ATTEMPTS) > 0
+    still_failed: list = []
+    if confirmed and do_regen:
+        emit_phase_status(
+            None,
+            f"Regenerating {len(confirmed)} confirmed fail(s)",
+            total_start_time=true_start_time,
+        )
+
+        regen_result = regenerate_failed_chunks(
+            failed=confirmed,
             cond_emb=cond_emb,
             ckpt_dir=ckpt_dir,
             device=device,
@@ -159,19 +628,99 @@ def _run_phase3_regen(
             voice_path=voice_path,
             turbo_ckpt_dir=turbo_ckpt_dir,
             audio_output_dir=audio_chunks_dir,
-            asr_client=asr_client,
+            asr_client=None,
+            asr_batch_config=score_config,
+            asr_batch_work_dir=Path(tts_dir),
             asr_threshold=asr_threshold,
-            local_scoring_enabled=bool(local_scores),
-            # tts_engine.py's own MAX_REGENERATION_ATTEMPTS (already GUI-overridden
-            # above via quality_params) -- regeneration_engine.py's own `from
-            # config.config import MAX_REGENERATION_ATTEMPTS` captured the static
-            # config.py value at import time and never sees this override otherwise.
+            local_scoring_enabled=False,
             max_attempts=MAX_REGENERATION_ATTEMPTS,
             report_dir=Path(tts_dir),
         )
+        still_failed = list(regen_result.get("still_failed") or [])
+    elif confirmed and not do_regen:
+        logging.info("ASR report-only: skipping regeneration (%d confirmed)", len(confirmed))
+        print("[Regen] Report-only: leaving chunk WAVs in place")
+        still_failed = []
+        inv_dir = Path(audio_chunks_dir) / "Investigation"
+        inv_dir.mkdir(parents=True, exist_ok=True)
+        import shutil as _shutil
 
-    if asr_client is not None:
-        asr_client.shutdown()
+        for item in confirmed:
+            cid = f"{int(item['chunk_id']):05d}"
+            src = Path(audio_chunks_dir) / f"chunk_{cid}.wav"
+            if src.exists():
+                _shutil.copy2(src, inv_dir / f"chunk_{cid}_original.wav")
+            report_row = dict(item)
+            report_row.update(
+                {
+                    "text": item.get("text") or item.get("expected_text") or "",
+                    "expected_text": item.get("expected_text") or item.get("text") or "",
+                    "original_score": item.get("original_score", item.get("score")),
+                    "best_score": item.get("score", item.get("original_score")),
+                    "threshold": asr_threshold,
+                    "status": "not_attempted",
+                    "attempts": [],
+                    "original_wav": str(inv_dir / f"chunk_{cid}_original.wav"),
+                    "attempt_wavs": [],
+                    "best_attempt": None,
+                    "retry_won": False,
+                }
+            )
+            still_failed.append(report_row)
+
+    # Regeneration writes these canonical reports itself.  Report-only and
+    # zero-failure runs must also overwrite them so stale prior-book rows cannot
+    # appear in Repair Tool after a new run.
+    if not (confirmed and do_regen):
+        for report_name in (
+            "asr_remaining_failures.json",
+            "asr_failed_regenerations.json",
+            "asr_investigation_failures.json",
+        ):
+            _write_asr_json(tts_dir / report_name, still_failed)
+
+    stage2_ran = (not is_stage_two_disabled(stage2_model)) and bool(stage1_failures)
+    summary = {
+        "stage1_failed": len(stage1_failures),
+        "stage1_unscored": len(stage1_unscored),
+        "stage2_failed": len(confirmed),
+        "stage2_unscored": len(stage2_unscored),
+        "stage2_ran": stage2_ran,
+        "regen_attempted": int(do_regen and bool(confirmed)),
+        "regen_still_failed": len(still_failed),
+        "investigation_dir": str(Path(audio_chunks_dir) / "Investigation"),
+        "still_failed_ids": [
+            int(item["chunk_id"]) for item in still_failed if item.get("chunk_id") is not None
+        ],
+        "stage1_backend": stage1_backend,
+        "stage1_model": stage1_model,
+        "stage1_actual_devices": stage1_devices,
+        "stage1_elapsed_s": round(stage1_secs, 3),
+        "stage1_chunks_per_s": round(
+            (stage1_scored / stage1_secs) if stage1_secs > 0 else 0.0, 3
+        ),
+        "stage2_backend": stage2_backend if stage2_ran else "",
+        "stage2_model": stage2_model if stage2_ran else "",
+        "stage2_actual_devices": stage2_devices if stage2_ran else [],
+        "stage2_load_s": round(stage2_load_secs, 3),
+        "stage2_score_s": round(stage2_score_secs, 3),
+        "stage2_elapsed_s": round(stage2_secs, 3),
+        "stage2_chunks_per_s": round(
+            ((len(stage1_failures) - len(stage2_unscored)) / stage2_score_secs)
+            if stage2_ran and stage2_score_secs > 0
+            else 0.0,
+            3,
+        ),
+    }
+    _write_asr_json(Path(tts_dir) / "asr_run_summary.json", summary)
+    print(
+        f"[ASR] Summary: Stage 1 fails={summary['stage1_failed']} "
+        f"in {_fmt_asr_elapsed(stage1_secs)} | "
+        f"Stage 2 fails={summary['stage2_failed']} "
+        f"in {_fmt_asr_elapsed(stage2_secs)} | "
+        f"Regen still failing={summary['regen_still_failed']}"
+    )
+    return summary
 
 # Suppress noisy syntax warnings emitted by pydub's regex helpers
 warnings.filterwarnings("ignore", category=SyntaxWarning, module="pydub.utils")
@@ -371,6 +920,7 @@ from modules.file_manager import (
     get_audio_files_in_directory,
     convert_to_m4b,
     add_metadata_to_m4b,
+    wipe_chunk_outputs,
 )
 from modules.progress_tracker import (
     setup_logging,
@@ -1731,6 +2281,7 @@ def process_one_chunk(
             try:
                 # Build audio segment and export timings (sync pre-measure for partial)
                 import time as _time
+                import soundfile as sf
 
                 t4 = _time.perf_counter()
                 with io.BytesIO() as wav_buffer:
@@ -1794,10 +2345,6 @@ def process_one_chunk(
                 wav = wav.unsqueeze(0)
 
             # Convert tensor to AudioSegment for in-memory processing
-            import io
-            import soundfile as sf
-            from pydub import AudioSegment
-
             # Get sample rate from backend or model
             sample_rate = 24000  # Default sample rate
             if backend is not None:
@@ -2215,6 +2762,9 @@ def generate_enriched_chunks(
             min_words_override = int(
                 config_params.get("min_chunk_words", MIN_CHUNK_WORDS)
             )
+        chunk_mode = None
+        if config_params:
+            chunk_mode = config_params.get("chunking_mode")
         chunks = sentence_chunk_text(
             cleaned,
             max_words=max_words_override
@@ -2223,6 +2773,7 @@ def generate_enriched_chunks(
             min_words=min_words_override
             if min_words_override is not None
             else MIN_CHUNK_WORDS,
+            mode=chunk_mode,
         )
     except Exception:
         # Fallback to config defaults if overrides invalid
@@ -2340,8 +2891,8 @@ def generate_enriched_chunks(
             chunk_text, i, chunk_texts, is_para_end
         )
 
-        # Manual "~1"/"~2" shorthand -> [pause:Xms] tags (before punctuation-based
-        # tags below, so both sources land in the same bracket-tag format).
+        # Manual "~N" shorthand -> [pause:Xms] tags (before punctuation-based tags
+        # below, so both sources land in the same bracket-tag format).
         try:
             chunk_text = convert_inline_markers_to_pause_tags(chunk_text)
         except Exception as e:
@@ -2384,6 +2935,10 @@ def generate_enriched_chunks(
         except Exception:
             pass
         enriched.append(entry)
+
+    from modules.chapter_headers import assign_chapter_ids
+
+    enriched = assign_chapter_ids(enriched)
 
     output_json_path = output_dir / "chunks_info.json"
 
@@ -2472,6 +3027,33 @@ def create_parameter_microbatches(chunks):
     return chunk_batches
 
 
+def _t3_source_and_variant(cfg):
+    """Resolve T3 checkpoint source, vLLM variant string, and language id.
+
+    Args:
+        cfg: The live config module (config.config).
+
+    Returns:
+        Tuple of (t3_source, variant, language_id).
+    """
+    if hasattr(cfg, "resolve_t3_source"):
+        source = cfg.resolve_t3_source()
+    else:
+        source = getattr(cfg, "T3_SOURCE", getattr(cfg, "VLLM_MODEL_VARIANT", "english"))
+    if hasattr(cfg, "t3_vllm_variant"):
+        variant = cfg.t3_vllm_variant(source)
+    else:
+        source_l = str(source).lower()
+        if source_l in ("english", "en", "standard"):
+            variant = "english"
+        elif source_l == "turbo":
+            variant = "turbo"
+        else:
+            variant = "multilingual"
+    language_id = getattr(cfg, "T3_LANGUAGE", getattr(cfg, "VLLM_DEFAULT_LANGUAGE", "en"))
+    return source, variant, language_id
+
+
 def process_book_folder(
     book_dir,
     voice_path,
@@ -2482,7 +3064,7 @@ def process_book_folder(
     quality_params=None,
     config_params=None,
     specific_text_file=None,
-    asr_threshold=0.75,
+    asr_threshold=None,
     backend=None,
     fast_tts=None,
     asr_level="moderate",
@@ -2492,8 +3074,25 @@ def process_book_folder(
     """Process a book through configured TTS phases.
 
     Args:
+        book_dir: Source book directory containing the selected text file.
+        voice_path: Selected voice WAV used to derive TTS conditionals.
+        tts_params: GUI TTS sampling parameters and VADER selection.
+        device: Target generation device.
+        skip_cleanup: Preserve current chunks for a resume operation when true.
+        enable_asr: Explicit ASR enablement override, when supplied.
+        quality_params: GUI quality, ASR, export, and chapter settings.
+        config_params: GUI runtime configuration overrides.
+        specific_text_file: Explicit source text path chosen by the GUI.
+        asr_threshold: Spoken-comparison threshold override.
+        backend: Optional preloaded legacy backend.
+        fast_tts: Optional preloaded fast backend.
+        asr_level: Legacy Stage 1 model/tier selector.
+        asr_device: Requested CPU or CUDA ASR device.
         existing_json_path: Optional preprocessed ``chunks_info.json`` to use
             verbatim instead of re-chunking the source text.
+
+    Returns:
+        Final M4B path, combined WAV path, and legacy run-log lines.
     """
 
     existing_json_data = None
@@ -2551,6 +3150,9 @@ def process_book_folder(
     # Start terminal logging to capture all output
     start_terminal_logging("term.log")
 
+    if asr_threshold is None:
+        asr_threshold = float(globals().get("DEFAULT_ASR_THRESHOLD", 0.65) or 0.65)
+
     print(
         f"🔍 DEBUG: Entering process_book_folder with book_dir='{book_dir}', voice_path='{voice_path}'"
     )
@@ -2570,6 +3172,8 @@ def process_book_folder(
             SENTIMENT_SMOOTHING_WINDOW, \
             SENTIMENT_SMOOTHING_METHOD, \
             SPECTRAL_ANOMALY_THRESHOLD
+        global ASR_STAGE1_MODEL, ASR_STAGE2_MODEL, ASR_STAGE1_BACKEND, ASR_STAGE2_BACKEND
+        global WRITE_M4B, WRITE_MP3, WRITE_WAV, CHAPTERIZE, CHAPTER_MODE, MAX_CHAPTER_MINUTES
 
         ENABLE_REGENERATION_LOOP = quality_params.get(
             "regeneration_enabled", ENABLE_REGENERATION_LOOP
@@ -2598,6 +3202,22 @@ def process_book_folder(
         )
         SPECTRAL_ANOMALY_THRESHOLD = quality_params.get(
             "spectral_threshold", SPECTRAL_ANOMALY_THRESHOLD
+        )
+        ASR_STAGE1_MODEL = quality_params.get("asr_stage1_model", ASR_STAGE1_MODEL)
+        ASR_STAGE2_MODEL = quality_params.get("asr_stage2_model", ASR_STAGE2_MODEL)
+        ASR_STAGE1_BACKEND = (
+            quality_params.get("asr_stage1_backend") or "faster_whisper"
+        )
+        ASR_STAGE2_BACKEND = (
+            quality_params.get("asr_stage2_backend") or "faster_whisper"
+        )
+        WRITE_M4B = quality_params.get("write_m4b", WRITE_M4B)
+        WRITE_MP3 = quality_params.get("write_mp3", WRITE_MP3)
+        WRITE_WAV = quality_params.get("write_wav", WRITE_WAV)
+        CHAPTERIZE = quality_params.get("chapterize", CHAPTERIZE)
+        CHAPTER_MODE = quality_params.get("chapter_mode", CHAPTER_MODE)
+        MAX_CHAPTER_MINUTES = quality_params.get(
+            "max_chapter_minutes", MAX_CHAPTER_MINUTES
         )
 
         print(
@@ -2702,22 +3322,23 @@ def process_book_folder(
                 ):
                     from config import config as _cfg
 
-                    if "inline_comma_ms" in config_params:
-                        _cfg.PUNCTUATION_PAUSE_MAPPING[","] = config_params[
-                            "inline_comma_ms"
-                        ]
-                    if "inline_period_ms" in config_params:
-                        _cfg.PUNCTUATION_PAUSE_MAPPING["."] = config_params[
-                            "inline_period_ms"
-                        ]
-                    if "inline_question_ms" in config_params:
-                        _cfg.PUNCTUATION_PAUSE_MAPPING["?"] = config_params[
-                            "inline_question_ms"
-                        ]
-                    if "inline_exclamation_ms" in config_params:
-                        _cfg.PUNCTUATION_PAUSE_MAPPING["!"] = config_params[
-                            "inline_exclamation_ms"
-                        ]
+                    def _apply_inline_ms(mark: str, key: str) -> None:
+                        """Set a mapping entry only when the GUI value is a positive split."""
+                        if key not in config_params:
+                            return
+                        try:
+                            ms = int(config_params[key])
+                        except (TypeError, ValueError):
+                            return
+                        if ms > 0:
+                            _cfg.PUNCTUATION_PAUSE_MAPPING[mark] = ms
+                        else:
+                            _cfg.PUNCTUATION_PAUSE_MAPPING.pop(mark, None)
+
+                    _apply_inline_ms(",", "inline_comma_ms")
+                    _apply_inline_ms(".", "inline_period_ms")
+                    _apply_inline_ms("?", "inline_question_ms")
+                    _apply_inline_ms("!", "inline_exclamation_ms")
                     print("🎵 Updated inline pause mapping from GUI values")
             except Exception as _e:
                 print(f"⚠️ Failed to apply audio_processor overrides: {_e}")
@@ -2787,22 +3408,10 @@ def process_book_folder(
         print(f"📁 Preserving: {text_chunks_dir}, {audio_chunks_dir}")
     else:
         print("🧹 FRESH PROCESSING: Cleaning previous processing files...")
-
-        # Clear text chunks
-        for txt_file in text_chunks_dir.glob("*.txt"):
-            txt_file.unlink(missing_ok=True)
-        for json_file in text_chunks_dir.glob("*.json"):
-            json_file.unlink(missing_ok=True)
-
-        # Clear audio chunks
-        for wav_file in audio_chunks_dir.glob("*.wav"):
-            wav_file.unlink(missing_ok=True)
-
-        # Clear logs
-        for log_file in output_root.glob("*.log"):
-            log_file.unlink(missing_ok=True)
-
-        print("✅ Cleanup complete")
+        wipe_chunk_outputs(
+            tts_dir, text_chunks_dir, audio_chunks_dir, output_root=output_root
+        )
+        print("✅ Cleanup complete (text_chunks, audio_chunks, Failed/, ASR reports)")
 
     # Find book files
     print("🔍 DEBUG: Calling find_book_files...")
@@ -2942,7 +3551,39 @@ def process_book_folder(
     # Prepare voice sample compatibility once; reload model per-batch below
     compatible_voice = ensure_voice_sample_compatibility(voice_path, output_dir=tts_dir)
     backend_choice = getattr(_cfg, "TTS_BACKEND", "standard").lower()
+    if tts_params.get("t3_source"):
+        _cfg.T3_SOURCE = tts_params["t3_source"]
+    if tts_params.get("t3_language"):
+        _cfg.T3_LANGUAGE = tts_params["t3_language"]
+    t3_source, t3_variant, t3_language = _t3_source_and_variant(_cfg)
+    s3gen_decoder = str(tts_params.get("s3gen_decoder", "turbo")).strip().lower()
+    if s3gen_decoder not in {"turbo", "standard"}:
+        raise ValueError(
+            f"Unknown S3Gen decoder {s3gen_decoder!r}; expected 'turbo' or 'standard'"
+        )
     logging.info("🔧 Effective TTS backend: %s", backend_choice)
+    logging.info(
+        "🔧 T3 source: %s | variant: %s | language: %s | S3Gen: %s",
+        t3_source,
+        t3_variant,
+        t3_language,
+        s3gen_decoder,
+    )
+    asr_enabled_resolved = bool(enable_asr if enable_asr is not None else ENABLE_ASR)
+    run_metadata = {
+        "text_file": str(text_file_to_use),
+        "voice_sample": voice_path.name,
+        "vader_enabled": bool(tts_params.get("use_vader", True)),
+        "asr_enabled": asr_enabled_resolved,
+        "stage1_backend": str(globals().get("ASR_STAGE1_BACKEND", "faster_whisper")),
+        "stage1_model": str(globals().get("ASR_STAGE1_MODEL", "base")),
+        "stage2_backend": str(globals().get("ASR_STAGE2_BACKEND", "faster_whisper")),
+        "stage2_model": str(globals().get("ASR_STAGE2_MODEL", "medium")),
+        "t3_encoder": str(t3_source),
+        "s3gen_decoder": s3gen_decoder,
+        "tts_params": dict(tts_params),
+        "run_timestamp": datetime.now().strftime("%m%d-%H%M"),
+    }
     if backend_choice == "vllm":
         logging.info("🎯 TTS backend set to vLLM. Running three-phase pipeline.")
         json_path = text_chunks_dir / "chunks_info.json"
@@ -2969,7 +3610,7 @@ def process_book_folder(
         cond_emb = compute_conditionals(
             ckpt_dir=ckpt_dir,
             target_device=device,
-            variant=getattr(_cfg, "VLLM_MODEL_VARIANT", "english"),
+            variant=t3_variant,
             audio_prompt_path=str(compatible_voice) if compatible_voice else None,
         )
         logging.info("Conditionals computed (shape: %s)", cond_emb.shape)
@@ -3000,62 +3641,68 @@ def process_book_folder(
         batch_processor = VllmBatchProcessor(
             ckpt_dir=ckpt_dir,
             target_device=device,
-            variant=getattr(_cfg, "VLLM_MODEL_VARIANT", "english"),
+            variant=t3_variant,
+            language_id=t3_language,
         )
         tokens_dict, chunks_data = batch_processor.process_chunks(
             json_path=json_path,
             cond_emb=cond_emb,
             progress_callback=phase1_progress,
         )
+        phase1_end_time = time.time()
         log_vram_checkpoint("before vLLM shutdown")
         batch_processor.shutdown()
         batch_processor = None
         gc.collect()
-        log_vram_checkpoint("after vLLM shutdown, before Turbo S3Gen")
+        log_vram_checkpoint("after vLLM shutdown, before selected S3Gen")
         chunk_meta = _build_chunk_meta(chunks_data)
 
         logging.info("=" * 70)
-        logging.info("PHASE 2: Generating audio with standard S3Gen decoder")
+        logging.info("PHASE 2: Generating audio with %s S3Gen decoder", s3gen_decoder)
         logging.info("=" * 70)
         phase2_start = time.time()
 
         def phase2_progress(current, total, message):
             """Reports Phase 2 (S3Gen decode) progress to the GUI status panel."""
             emit_phase_status(
-                2, "Decoding audio (S3Gen)", current, total,
+                2, f"Decoding audio ({s3gen_decoder.title()} S3Gen)", current, total,
                 phase_start_time=phase2_start, total_start_time=true_start_time,
             )
 
-        variant = getattr(_cfg, "VLLM_MODEL_VARIANT", "english")
-        asr_enabled_resolved = enable_asr if enable_asr is not None else ENABLE_ASR
-        asr_client = _maybe_start_asr_daemon(tts_dir, asr_enabled_resolved, asr_level, asr_device)
+        variant = t3_variant
+        if asr_enabled_resolved:
+            print("[ASR] Stage 1 is scheduled after S3Gen shutdown; no ASR daemon starts during decode")
 
         decoder = VllmDecoder(
-            decoder_type="standard",
+            decoder_type=s3gen_decoder,
             ckpt_dir=ckpt_dir,
             target_device=device,
             voice_path=compatible_voice,
+            turbo_ckpt_dir=getattr(_cfg, "TURBO_CKPT_DIR", None),
         )
         generated, skipped, local_scores = decoder.decode_tokens(
             tokens_dict=tokens_dict,
             audio_output_dir=audio_chunks_dir,
             chunk_meta=chunk_meta,
             progress_callback=phase2_progress,
-            asr_client=asr_client,
+            asr_client=None,
             asr_threshold=asr_threshold,
-            enable_quality_scoring=ENABLE_REGENERATION_LOOP and asr_client is not None,
+            enable_quality_scoring=False,
         )
         # Captured HERE, before decoder.shutdown()/Phase 3's ASR wait -- not after --
-        # so the "Elapsed Time"/"Realtime Factor" stat below reflects pure generation
+        # so the "Elapsed Time"/"Realtime RAW" stat below reflects pure generation
         # time, not however long Phase 3 took to collect ASR results.
         phase2_end_time = time.time()
         decoder.shutdown()
+        decoder = None
+        gc.collect()
+        log_vram_checkpoint("after selected S3Gen shutdown, before Stage 1")
 
         logging.info("=" * 70)
         logging.info(f"PHASE 2 complete: {generated} generated, {skipped} skipped")
         logging.info("=" * 70)
 
-        _run_phase3_regen(
+        asr_summary = _run_phase3_regen(
             chunk_meta=chunk_meta,
             tokens_dict=tokens_dict,
             local_scores=local_scores,
@@ -3065,10 +3712,11 @@ def process_book_folder(
             ckpt_dir=ckpt_dir,
             device=device,
             variant=variant,
-            decoder_type="standard",
+            decoder_type=s3gen_decoder,
             voice_path=compatible_voice,
-            turbo_ckpt_dir=None,
-            asr_client=asr_client,
+            turbo_ckpt_dir=getattr(_cfg, "TURBO_CKPT_DIR", None),
+            asr_enabled=asr_enabled_resolved,
+            asr_device=asr_device,
             asr_threshold=asr_threshold,
             true_start_time=true_start_time,
         )
@@ -3077,7 +3725,7 @@ def process_book_folder(
         # FINALIZE: Combine audio chunks and create M4B
         # ============================================================
         # start_time=phase1_start (not the outer start_time, which predates Phase 0):
-        # "Elapsed Time"/"Realtime Factor" should span Phase 1 start -> Phase 2 finish
+        # "Elapsed Time"/"Realtime RAW" should span Phase 1 start -> Phase 2 finish
         # only, excluding Phase 0's conditional-computation time. generation_elapsed
         # pins that span explicitly so Phase 3's ASR wait (which happens after this
         # point, before _finalize_book_output runs) can't inflate it.
@@ -3093,6 +3741,10 @@ def process_book_folder(
             generation_elapsed=phase2_end_time - phase1_start,
             total_start_time=true_start_time,
             tts_params=tts_params,
+            run_metadata=run_metadata,
+            phase1_elapsed=phase1_end_time - phase1_start,
+            phase2_elapsed=phase2_end_time - phase2_start,
+            asr_summary=asr_summary,
         )
 
     elif backend_choice == "turbo-hybrid":
@@ -3108,9 +3760,14 @@ def process_book_folder(
         import os
         os.environ["CHATTERBOX_CFG_SCALE"] = str(tts_params.get("cfg_weight", 0.5))
 
-        # ============================================================
-        # PHASE 0: Compute conditionals (loads VE + S3Gen fp16, frees cleanly)
-        # ============================================================
+        def phase1_progress(current, total):
+            """Reports Phase 1 (token generation) progress to the GUI status panel."""
+            emit_phase_status(
+                1, "Generating speech tokens", current, total,
+                phase_start_time=phase1_start, total_start_time=true_start_time,
+            )
+
+        # Phase 1 is always vLLM, including Turbo T3 safetensors (GPT2 ChatterboxT3Turbo).
         logging.info("=" * 70)
         logging.info("PHASE 0: Computing voice conditionals")
         logging.info("=" * 70)
@@ -3120,77 +3777,64 @@ def process_book_folder(
         cond_emb = compute_conditionals(
             ckpt_dir=ckpt_dir,
             target_device=device,
-            variant=getattr(_cfg, "VLLM_MODEL_VARIANT", "english"),
+            variant=t3_variant,
             audio_prompt_path=str(compatible_voice) if compatible_voice else None,
         )
         logging.info("Conditionals computed (shape: %s)", cond_emb.shape)
 
-        # ============================================================
-        # PHASE 1: Generate speech tokens (T3-only vLLM)
-        # ============================================================
         logging.info("=" * 70)
-        logging.info("PHASE 1: Generating tokens (T3-only vLLM)")
+        logging.info("PHASE 1: Generating tokens (T3-only vLLM, source=%s)", t3_source)
         logging.info("=" * 70)
         phase1_start = time.time()
-
-        def phase1_progress(current, total):
-            """Reports Phase 1 (token generation) progress to the GUI status panel."""
-            emit_phase_status(
-                1, "Generating speech tokens", current, total,
-                phase_start_time=phase1_start, total_start_time=true_start_time,
-            )
-
-        # Emit immediately, before the (potentially slow) engine load, so the panel
-        # leaves "Phase 0" the instant Phase 1 begins rather than staying stuck on
-        # Phase 0's text through engine load + the first token-generation batch.
         emit_phase_status(
             1, "Loading T3 model (vLLM engine)",
             phase_start_time=phase1_start, total_start_time=true_start_time,
         )
-
         batch_processor = VllmBatchProcessor(
             ckpt_dir=ckpt_dir,
             target_device=device,
-            variant=getattr(_cfg, "VLLM_MODEL_VARIANT", "english"),
+            variant=t3_variant,
+            language_id=t3_language,
         )
         tokens_dict, chunks_data = batch_processor.process_chunks(
             json_path=json_path,
             cond_emb=cond_emb,
             progress_callback=phase1_progress,
         )
+        phase1_end_time = time.time()
         log_vram_checkpoint("before vLLM shutdown")
         batch_processor.shutdown()
         batch_processor = None
         gc.collect()
-        log_vram_checkpoint("after vLLM shutdown, before Turbo S3Gen")
+        log_vram_checkpoint("after vLLM shutdown, before selected S3Gen")
         chunk_meta = _build_chunk_meta(chunks_data)
 
         # ============================================================
-        # PHASE 2: Convert tokens to audio using TURBO S3Gen (5x faster)
+        # PHASE 2: Convert tokens to audio using the selected S3Gen decoder.
         # ============================================================
         logging.info("=" * 70)
-        logging.info("PHASE 2: Converting tokens to audio (Turbo S3Gen - 5x faster)")
+        logging.info("PHASE 2: Converting tokens to audio (%s S3Gen)", s3gen_decoder.title())
         logging.info("=" * 70)
         phase2_start = time.time()
 
-        variant = getattr(_cfg, "VLLM_MODEL_VARIANT", "english")
-        asr_enabled_resolved = enable_asr if enable_asr is not None else ENABLE_ASR
-        asr_client = _maybe_start_asr_daemon(tts_dir, asr_enabled_resolved, asr_level, asr_device)
+        variant = t3_variant
+        if asr_enabled_resolved:
+            print("[ASR] Stage 1 is scheduled after S3Gen shutdown; no ASR daemon starts during decode")
 
         try:
             def audio_progress(current, total, message):
-                """Reports Phase 2 (Turbo S3Gen decode) progress to the GUI status panel."""
-                logging.info(f"[Turbo S3Gen] {message}")
-                print(f"[Turbo S3Gen Audio] {message}")
+                """Report selected-S3Gen Phase 2 progress to the GUI status panel."""
+                logging.info("[%s S3Gen] %s", s3gen_decoder.title(), message)
+                print(f"[{s3gen_decoder.title()} S3Gen Audio] {message}")
                 sys.stdout.flush()
                 emit_phase_status(
-                    2, "Decoding audio (Turbo S3Gen)", current, total,
+                    2, f"Decoding audio ({s3gen_decoder.title()} S3Gen)", current, total,
                     phase_start_time=phase2_start, total_start_time=true_start_time,
                 )
 
             turbo_ckpt_dir = getattr(_cfg, "TURBO_CKPT_DIR", None)
             decoder = VllmDecoder(
-                decoder_type="turbo",
+                decoder_type=s3gen_decoder,
                 ckpt_dir=ckpt_dir,
                 target_device=device,
                 voice_path=compatible_voice,
@@ -3201,15 +3845,18 @@ def process_book_folder(
                 audio_output_dir=audio_chunks_dir,
                 chunk_meta=chunk_meta,
                 progress_callback=audio_progress,
-                asr_client=asr_client,
+                asr_client=None,
                 asr_threshold=asr_threshold,
-                enable_quality_scoring=ENABLE_REGENERATION_LOOP and asr_client is not None,
+                enable_quality_scoring=False,
             )
             # Captured HERE, before decoder.shutdown()/Phase 3's ASR wait -- not after --
-            # so the "Elapsed Time"/"Realtime Factor" stat below reflects pure generation
+            # so the "Elapsed Time"/"Realtime RAW" stat below reflects pure generation
             # time, not however long Phase 3 took to collect ASR results.
             phase2_end_time = time.time()
             decoder.shutdown()
+            decoder = None
+            gc.collect()
+            log_vram_checkpoint("after selected S3Gen shutdown, before Stage 1")
 
             logging.info(
                 f"Phase 2 complete: {generated} chunks generated, {skipped} skipped"
@@ -3221,7 +3868,7 @@ def process_book_folder(
                 f"Turbo-Hybrid Phase 2 audio generation failed: {e}"
             ) from e
 
-        _run_phase3_regen(
+        asr_summary = _run_phase3_regen(
             chunk_meta=chunk_meta,
             tokens_dict=tokens_dict,
             local_scores=local_scores,
@@ -3231,10 +3878,11 @@ def process_book_folder(
             ckpt_dir=ckpt_dir,
             device=device,
             variant=variant,
-            decoder_type="turbo",
+            decoder_type=s3gen_decoder,
             voice_path=compatible_voice,
             turbo_ckpt_dir=turbo_ckpt_dir,
-            asr_client=asr_client,
+            asr_enabled=asr_enabled_resolved,
+            asr_device=asr_device,
             asr_threshold=asr_threshold,
             true_start_time=true_start_time,
         )
@@ -3243,7 +3891,7 @@ def process_book_folder(
         # FINALIZE: Combine audio chunks and create M4B
         # ============================================================
         # start_time=phase1_start (not the outer start_time, which predates Phase 0):
-        # "Elapsed Time"/"Realtime Factor" should span Phase 1 start -> Phase 2 finish
+        # "Elapsed Time"/"Realtime RAW" should span Phase 1 start -> Phase 2 finish
         # only, excluding Phase 0's conditional-computation time. generation_elapsed
         # pins that span explicitly so Phase 3's ASR wait (which happens after this
         # point, before _finalize_book_output runs) can't inflate it.
@@ -3259,6 +3907,10 @@ def process_book_folder(
             generation_elapsed=phase2_end_time - phase1_start,
             total_start_time=true_start_time,
             tts_params=tts_params,
+            run_metadata=run_metadata,
+            phase1_elapsed=phase1_end_time - phase1_start,
+            phase2_elapsed=phase2_end_time - phase2_start,
+            asr_summary=asr_summary,
         )
 
     elif backend_choice == "turbo":
@@ -3462,6 +4114,7 @@ def process_book_folder(
             run_log_lines=run_log_lines,
             start_time=start_time,
             tts_params=turbo_tts_params,
+            run_metadata=run_metadata,
         )
 
     elif backend_choice == "original_vllm":
@@ -3666,6 +4319,7 @@ if __name__ == "__main__":
             run_log_lines=run_log_lines,
             start_time=start_time,
             tts_params=tts_params,
+            run_metadata=run_metadata,
         )
 
         logging.info(
@@ -3685,6 +4339,7 @@ if __name__ == "__main__":
             run_log_lines=run_log_lines,
             start_time=start_time,
             tts_params=tts_params,
+            run_metadata=run_metadata,
         )
 
     for batch_start in range(0, total_chunks, BATCH_SIZE):
@@ -4119,7 +4774,142 @@ if __name__ == "__main__":
         run_log_lines=run_log_lines,
         start_time=start_time,
         tts_params=tts_params,
+        run_metadata=run_metadata,
     )
+
+
+def _write_timestamped_tts_run_log(
+    tts_dir: Path,
+    run_metadata: dict,
+    run_stats: dict,
+    timestamp: str | None = None,
+) -> Path:
+    """Write a collision-safe completed-run summary into the book's TTS folder.
+
+    Args:
+        tts_dir: Destination book-level TTS directory.
+        run_metadata: Immutable settings captured when this run started.
+        run_stats: Measured phase, ASR, audio, and export results.
+        timestamp: Optional ``MMDD-HHMM`` value for deterministic tests.
+
+    Returns:
+        Newly-created ``run_MMDD-HHMM[_{n}].log`` path. Existing logs are
+        never overwritten, even when two runs start in the same minute.
+    """
+    tts_dir = Path(tts_dir)
+    tts_dir.mkdir(parents=True, exist_ok=True)
+    metadata = dict(run_metadata or {})
+    timestamp = (
+        timestamp
+        or metadata.get("run_timestamp")
+        or datetime.now().strftime("%m%d-%H%M")
+    )
+    run_log_path = tts_dir / f"run_{timestamp}.log"
+    suffix = 2
+    while run_log_path.exists():
+        run_log_path = tts_dir / f"run_{timestamp}_{suffix:02d}.log"
+        suffix += 1
+
+    stats = dict(run_stats or {})
+    params = dict(metadata.get("tts_params") or {})
+    asr_summary = dict(stats.get("asr_summary") or {})
+    asr_enabled = bool(metadata.get("asr_enabled"))
+    stage1_backend = asr_summary.get("stage1_backend") or metadata.get(
+        "stage1_backend", "faster_whisper"
+    )
+    stage1_model = asr_summary.get("stage1_model") or metadata.get(
+        "stage1_model", "base"
+    )
+    stage2_backend = asr_summary.get("stage2_backend") or metadata.get(
+        "stage2_backend", "faster_whisper"
+    )
+    stage2_model = asr_summary.get("stage2_model") or metadata.get(
+        "stage2_model", "medium"
+    )
+    stage2_disabled = str(stage2_model).strip().lower() == "disabled"
+    stage2_ran = bool(asr_summary.get("stage2_ran"))
+
+    output_types = []
+    if stats.get("write_m4b"):
+        output_types.append("M4B")
+    if stats.get("write_mp3"):
+        output_types.append("MP3")
+    if stats.get("write_wav"):
+        output_types.append("WAV")
+    output_type = ", ".join(output_types) if output_types else "Chunks only"
+
+    phase1_seconds = stats.get("phase1_elapsed")
+    phase2_seconds = stats.get("phase2_elapsed")
+    phase1_time = _fmt_asr_elapsed(phase1_seconds) if phase1_seconds is not None else "N/A"
+    phase2_time = _fmt_asr_elapsed(phase2_seconds) if phase2_seconds is not None else "N/A"
+    if asr_enabled:
+        asr_stage1_time = _fmt_asr_elapsed(asr_summary.get("stage1_elapsed_s", 0.0))
+        asr_stage1_fails = str(asr_summary.get("stage1_failed", 0))
+        if stage2_disabled:
+            asr_stage2_time = "Disabled"
+            asr_stage2_fails = "N/A"
+        elif stage2_ran:
+            asr_stage2_time = _fmt_asr_elapsed(asr_summary.get("stage2_elapsed_s", 0.0))
+            asr_stage2_fails = str(asr_summary.get("stage2_failed", 0))
+        else:
+            asr_stage2_time = "Not needed"
+            asr_stage2_fails = "0"
+        stage1_setting = f"{stage1_backend}:{stage1_model}"
+        stage2_setting = "Disabled" if stage2_disabled else f"{stage2_backend}:{stage2_model}"
+    else:
+        stage1_setting = "Disabled"
+        stage2_setting = "Disabled"
+        asr_stage1_time = "Not run"
+        asr_stage1_fails = "N/A"
+        asr_stage2_time = "Not run"
+        asr_stage2_fails = "N/A"
+
+    elapsed_seconds = float(stats.get("elapsed_seconds") or 0.0)
+    audio_seconds = float(stats.get("audio_seconds") or 0.0)
+    total_elapsed_seconds = float(stats.get("total_elapsed_seconds") or 0.0)
+    realtime_raw_factor = (
+        audio_seconds / elapsed_seconds if elapsed_seconds > 0 else 0.0
+    )
+    realtime_total_factor = (
+        audio_seconds / total_elapsed_seconds if total_elapsed_seconds > 0 else 0.0
+    )
+    lines = [
+        f"Run: {timestamp}",
+        f"Text File: {metadata.get('text_file', '')}",
+        f"Voice Sample: {metadata.get('voice_sample', '')}",
+        f"VADER: {bool(metadata.get('vader_enabled'))}",
+        f"ASR: {asr_enabled}",
+        f"Stage 1: {stage1_setting}",
+        f"Stage 2: {stage2_setting}",
+        "",
+        f"Exaggeration: {params.get('exaggeration', '')}",
+        f"Temperature: {params.get('temperature', '')}",
+        f"Min-p: {params.get('min_p', '')}",
+        f"Top-P: {params.get('top_p', '')}",
+        f"Rep. Penalty: {params.get('repetition_penalty', '')}",
+        f"CFG: {params.get('cfg_weight', '')}",
+        "",
+        f"T3 Encoder: {metadata.get('t3_encoder', '')}",
+        f"S3Gen: {metadata.get('s3gen_decoder', '')}",
+        f"Output Type: {output_type}",
+        f"Chapterise: {bool(stats.get('chapterize'))}",
+        f"Type: {stats.get('chapter_mode', '')}",
+        "",
+        f"Elapsed Time: {_fmt_asr_elapsed(elapsed_seconds)}",
+        f"Phase 1 Time: {phase1_time}",
+        f"Phase 2 Time: {phase2_time}",
+        f"ASR Stage 1: {asr_stage1_time}",
+        f"Fails: {asr_stage1_fails}",
+        f"ASR Stage 2: {asr_stage2_time}",
+        f"Fails: {asr_stage2_fails}",
+        f"Total Elapsed: {_fmt_asr_elapsed(total_elapsed_seconds)}",
+        f"Realtime RAW: {realtime_raw_factor:.2f}x",
+        f"Realtime Total: {realtime_total_factor:.2f}x",
+        f"Audio Duration: {_fmt_asr_elapsed(audio_seconds)}",
+        f"Chunks: {int(stats.get('chunk_count') or 0)}",
+    ]
+    run_log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return run_log_path
 
 
 def _finalize_book_output(
@@ -4134,8 +4924,37 @@ def _finalize_book_output(
     tts_params: dict,
     total_start_time: float | None = None,
     generation_elapsed: float | None = None,
+    run_metadata: dict | None = None,
+    phase1_elapsed: float | None = None,
+    phase2_elapsed: float | None = None,
+    asr_summary: dict | None = None,
 ):
-    """Shared concatenation + export logic for both legacy and vLLM backends."""
+    """Shared concatenation + export logic for both legacy and vLLM backends.
+
+    Encodes only the formats requested by WRITE_M4B / WRITE_MP3 / WRITE_WAV.
+    Full-book WAV is optional; M4B is encoded from the chunk list. Peak
+    normalization is a constant gain measured across chunk PCM, not loudnorm.
+
+    Args:
+        audio_chunks_dir: Current book's generated chunk-WAV directory.
+        output_root: Existing root for legacy run.log and exported book files.
+        voice_path: Voice sample selected for this run.
+        book_dir: Source book directory.
+        cover_file: Optional cover art path.
+        nfo_file: Optional metadata file path.
+        run_log_lines: Existing root-run-log content preserved for compatibility.
+        start_time: Start timestamp for generation elapsed/realtime math.
+        tts_params: Effective base TTS sampling parameters.
+        total_start_time: Conversion-start timestamp for total elapsed time.
+        generation_elapsed: Fixed Phase 1→2 duration when already measured.
+        run_metadata: Settings captured at run start for the TTS-folder log.
+        phase1_elapsed: Measured token-generation duration, if staged.
+        phase2_elapsed: Measured audio-decoding duration, if staged.
+        asr_summary: Returned Stage 1/2 statistics, if ASR ran.
+
+    Returns:
+        Tuple of final M4B path, combined WAV path, and legacy run-log lines.
+    """
     quarantine_dir = audio_chunks_dir / "quarantine"
     pause_for_chunk_review(quarantine_dir)
 
@@ -4147,20 +4966,15 @@ def _finalize_book_output(
         )
         return None, None, []
 
-    # elapsed_total is the realtime-factor window: pure generation time, excluding
-    # WAV-combine/M4B-conversion below AND (for vllm/turbo-hybrid callers) excluding
-    # Phase 3's ASR-collection wait, which happens between Phase 2 finishing and this
-    # function being called. generation_elapsed pins that window explicitly (captured
-    # by the caller right after Phase 2, before Phase 3 runs) so the ASR wait can't
-    # leak into it; legacy callers that don't pass it keep the old start_time-based
-    # measurement (function-entry time is still correct for them, no Phase 3 in between).
     elapsed_total = (
         generation_elapsed if generation_elapsed is not None else time.time() - start_time
     )
     elapsed_td = timedelta(seconds=int(elapsed_total))
 
+    from modules.audio_export import wav_duration_seconds
+
     total_audio_duration_final = sum(
-        get_chunk_audio_duration(chunk_path) for chunk_path in chunk_paths
+        wav_duration_seconds(chunk_path) for chunk_path in chunk_paths
     )
     audio_duration_td = timedelta(seconds=int(total_audio_duration_final))
     realtime_factor = (
@@ -4170,29 +4984,91 @@ def _finalize_book_output(
     print("\n⏱️ TTS Processing Complete:")
     print(f"   Elapsed Time: {CYAN}{str(elapsed_td)}{RESET}")
     print(f"   Audio Duration: {GREEN}{str(audio_duration_td)}{RESET}")
-    print(f"   Realtime Factor: {YELLOW}{realtime_factor:.2f}x{RESET}")
+    print(f"   Realtime RAW: {YELLOW}{realtime_factor:.2f}x{RESET}")
 
-    # Transition the GUI panel out of "Phase 2" while combine/M4B conversion run,
-    # instead of leaving it stuck on the last Phase 2 message with no feedback.
+    write_m4b = bool(globals().get("WRITE_M4B", True))
+    write_mp3 = bool(globals().get("WRITE_MP3", False))
+    write_wav = bool(globals().get("WRITE_WAV", False))
+    chapterize = bool(globals().get("CHAPTERIZE", False))
+    chapter_mode = str(globals().get("CHAPTER_MODE", "headings_only") or "headings_only")
+    max_chapter_minutes = float(globals().get("MAX_CHAPTER_MINUTES", 0) or 0)
+
     if total_start_time is not None:
         emit_phase_status(
-            None, "Finalizing: combining audio & converting to M4B",
+            None,
+            "Finalizing: stitching/export",
             total_start_time=total_start_time,
         )
 
     voice_name = (
         voice_path.stem if hasattr(voice_path, "stem") else Path(voice_path).stem
     )
-    combined_wav_path = output_root / f"{book_dir.name} [{voice_name}].wav"
-    print("\n💾 Saving WAV file...")
-    combine_audio_chunks(chunk_paths, combined_wav_path)
+    output_stem = f"{book_dir.name}[{voice_name}]"
+    combined_wav_path = None
+    final_m4b_path = None
 
-    temp_m4b_path = output_root / "output.m4b"
-    final_m4b_path = output_root / f"{book_dir.name}[{voice_name}].m4b"
-    convert_to_m4b(combined_wav_path, temp_m4b_path)
-    add_metadata_to_m4b(temp_m4b_path, final_m4b_path, cover_file, nfo_file)
+    print(
+        f"\n💾 Export flags: m4b={write_m4b} mp3={write_mp3} wav={write_wav} "
+        f"chapterize={chapterize} mode={chapter_mode}"
+    )
+    if write_m4b or write_mp3 or write_wav:
+        from modules.chapter_export import export_book_chapters
 
-    logging.info(f"Audiobook created: {final_m4b_path}")
+        tts_dir = Path(audio_chunks_dir).parent
+        export_result = export_book_chapters(
+            output_root,
+            chunks_json=tts_dir / "text_chunks" / "chunks_info.json",
+            audio_chunks_dir=audio_chunks_dir,
+            chapterize=chapterize,
+            max_chapter_minutes=max_chapter_minutes,
+            chapter_mode=chapter_mode,
+            write_m4b=write_m4b,
+            write_mp3=write_mp3,
+            write_wav=write_wav,
+            title=book_dir.name,
+            cover_path=cover_file,
+            nfo_path=nfo_file,
+            sample_rate=int(M4B_SAMPLE_RATE),
+            enable_normalization=bool(ENABLE_NORMALIZATION),
+            normalization_type=str(NORMALIZATION_TYPE),
+            target_peak_db=float(TARGET_PEAK_DB),
+            speed=float(ATEMPO_SPEED),
+            output_stem=output_stem,
+        )
+        if export_result.get("wav_path"):
+            combined_wav_path = Path(export_result["wav_path"])
+        if export_result.get("m4b_path"):
+            final_m4b_path = Path(export_result["m4b_path"])
+        logging.info(
+            "Export complete: chapters=%s m4b=%s mp3=%s wav=%s",
+            export_result.get("chapter_count"),
+            export_result.get("m4b_path"),
+            export_result.get("mp3_dir") or export_result.get("mp3_files"),
+            export_result.get("wav_path"),
+        )
+        run_log_lines.append(
+            f"Export: m4b={export_result.get('m4b_path')} "
+            f"mp3={export_result.get('mp3_files')} "
+            f"wav={export_result.get('wav_path')} "
+            f"chapters={export_result.get('chapter_count')} "
+            f"mode={export_result.get('chapter_mode')}"
+        )
+    else:
+        print("⚠️ No export formats selected; chunk WAVs left in place.")
+
+    # Calculate total elapsed/realtime before appending either value to logs.
+    # This keeps the variable defined on every export path, including callers
+    # that do not provide a separate total-start timestamp.
+    if total_start_time is not None:
+        total_elapsed_seconds = time.time() - total_start_time
+    else:
+        total_elapsed_seconds = elapsed_total
+    total_elapsed_td = timedelta(seconds=int(total_elapsed_seconds))
+    realtime_total_factor = (
+        total_audio_duration_final / total_elapsed_seconds
+        if total_elapsed_seconds > 0
+        else 0.0
+    )
 
     run_log_lines.extend(
         [
@@ -4208,23 +5084,52 @@ def _finalize_book_output(
             f"Temperature: {tts_params['temperature']}",
             f"Processing Time: {str(elapsed_td)}",
             f"Audio Duration: {str(audio_duration_td)}",
-            f"Realtime Factor: {realtime_factor:.2f}x",
+            f"Realtime RAW: {realtime_factor:.2f}x",
+            f"Realtime Total: {realtime_total_factor:.2f}x",
             f"Total Chunks: {len(chunk_paths)}",
         ]
     )
 
-    # total_start_time anchors button-press -> file-actually-written, so this has
-    # to be measured HERE (after WAV combine + M4B conversion above), not earlier.
     if total_start_time is not None:
-        total_elapsed_td = timedelta(seconds=int(time.time() - total_start_time))
         run_log_lines.append(f"Total Elapsed (start → output): {str(total_elapsed_td)}")
         print(f"   Total Elapsed (start → output): {CYAN}{str(total_elapsed_td)}{RESET}")
+        print(f"   Realtime Total: {YELLOW}{realtime_total_factor:.2f}x{RESET}")
         emit_final_status(
             elapsed=str(elapsed_td),
             audio=str(audio_duration_td),
             realtime=f"{realtime_factor:.2f}x",
+            realtime_total=f"{realtime_total_factor:.2f}x",
             total_elapsed=str(total_elapsed_td),
         )
+
+    effective_run_metadata = dict(run_metadata or {})
+    effective_run_metadata.setdefault("voice_sample", voice_name)
+    effective_run_metadata.setdefault("tts_params", dict(tts_params))
+    effective_run_metadata.setdefault("asr_enabled", bool(ENABLE_ASR))
+    try:
+        tts_run_log = _write_timestamped_tts_run_log(
+            Path(audio_chunks_dir).parent,
+            effective_run_metadata,
+            {
+                "elapsed_seconds": elapsed_total,
+                "phase1_elapsed": phase1_elapsed,
+                "phase2_elapsed": phase2_elapsed,
+                "asr_summary": asr_summary,
+                "total_elapsed_seconds": total_elapsed_seconds,
+                "audio_seconds": total_audio_duration_final,
+                "chunk_count": len(chunk_paths),
+                "write_m4b": write_m4b,
+                "write_mp3": write_mp3,
+                "write_wav": write_wav,
+                "chapterize": chapterize,
+                "chapter_mode": chapter_mode,
+            },
+        )
+        print(f"📝 Timestamped TTS run log written to: {tts_run_log}")
+    except Exception as exc:
+        # Export already succeeded; a diagnostics write failure must not fail the book.
+        logging.warning("Could not write timestamped TTS run log: %s", exc)
+        print(f"⚠️ Could not write timestamped TTS run log: {exc}")
 
     log_run("\n".join(run_log_lines), output_root / "run.log")
     print(f"📝 Run log written to: {output_root / 'run.log'}")

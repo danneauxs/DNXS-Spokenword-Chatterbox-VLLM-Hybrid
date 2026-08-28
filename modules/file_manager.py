@@ -582,6 +582,47 @@ def setup_book_directories(book_dir):
     return output_root, tts_dir, text_chunks_dir, audio_chunks_dir
 
 
+def wipe_chunk_outputs(tts_dir, text_chunks_dir, audio_chunks_dir, output_root=None):
+    """Delete text chunks, audio chunks (including Failed/), and old ASR files.
+
+    Used at the start of a fresh conversion so leftover WAVs, JSON, fail
+    reports, and ASR queue dirs cannot mix with the new run. Resume must not
+    call this.
+
+    Args:
+        tts_dir: Book TTS directory.
+        text_chunks_dir: text_chunks folder.
+        audio_chunks_dir: audio_chunks folder (Failed/ lives under this).
+        output_root: Optional book output root; *.log files are removed if set.
+
+    Returns:
+        None
+    """
+    import shutil
+
+    tts_dir = Path(tts_dir)
+    text_chunks_dir = Path(text_chunks_dir)
+    audio_chunks_dir = Path(audio_chunks_dir)
+
+    for folder in (text_chunks_dir, audio_chunks_dir):
+        if folder.exists():
+            shutil.rmtree(folder, ignore_errors=True)
+        folder.mkdir(parents=True, exist_ok=True)
+
+    # ASR IPC + reports from the previous run (not inside the chunk folders).
+    for path in tts_dir.glob("asr_*"):
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            path.unlink(missing_ok=True)
+    for name in ("asr_daemon.pid", "asr_daemon.shutdown", "asr_daemon.log"):
+        (tts_dir / name).unlink(missing_ok=True)
+
+    if output_root is not None:
+        for log_file in Path(output_root).glob("*.log"):
+            log_file.unlink(missing_ok=True)
+
+
 def find_book_files(book_dir):
     """Find text files, cover, and metadata for a book"""
     text_files = sorted(book_dir.glob("*.txt"))
@@ -605,70 +646,36 @@ def find_book_files(book_dir):
 
 
 def combine_audio_chunks(chunk_paths, output_path):
-    """Combine audio chunks into single file using FFmpeg"""
+    """Combine audio chunks into one WAV, preferring a native PCM frame copy.
+
+    Identical 24 kHz PCM chunk files are stitched by copying frames after one
+    shared header. FFmpeg concat-copy is only used when headers differ.
+
+    Args:
+        chunk_paths: Ordered list of chunk WAV paths.
+        output_path: Destination combined WAV path.
+
+    Returns:
+        The written output_path.
+    """
     logging.info(f"Combining {len(chunk_paths)} audio chunks into {output_path}")
 
-    # Validate input files exist
-    missing_files = []
-    for chunk_path in chunk_paths:
-        if not chunk_path.exists():
-            missing_files.append(str(chunk_path))
-
+    missing_files = [str(p) for p in chunk_paths if not Path(p).exists()]
     if missing_files:
-        error_msg = f"Missing chunk files: {missing_files[:5]}"  # Show first 5
+        error_msg = f"Missing chunk files: {missing_files[:5]}"
         if len(missing_files) > 5:
             error_msg += f" ... and {len(missing_files)-5} more"
         logging.error(error_msg)
         raise FileNotFoundError(error_msg)
 
-    # Ensure output directory exists
+    output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    from modules.audio_export import concat_wavs
 
-    # Create concat file
-    concat_list_path = output_path.parent / "concat.txt"
-    create_concat_file(chunk_paths, concat_list_path)
-
-    # Verify concat file was created
-    if not concat_list_path.exists():
-        raise FileNotFoundError(f"Failed to create concat file: {concat_list_path}")
-
-    logging.info(f"Created concat file: {concat_list_path}")
-
-    try:
-        run_ffmpeg(
-            [
-                "ffmpeg",
-                "-y",
-                "-f",
-                "concat",
-                "-safe",
-                "0",
-                "-i",
-                str(concat_list_path.resolve()),
-                "-c",
-                "copy",
-                str(output_path.resolve()),
-            ]
-        )
-
-        # Verify output file was created
-        if not output_path.exists():
-            raise RuntimeError(
-                f"FFmpeg completed but output file not found: {output_path}"
-            )
-
-        logging.info(f"Successfully combined audio chunks: {output_path}")
-
-    except Exception:
-        # Log concat file contents for debugging
-        try:
-            with open(concat_list_path, "r") as f:
-                concat_contents = f.read()
-            logging.error(f"Concat file contents:\n{concat_contents}")
-        except:
-            logging.error("Could not read concat file for debugging")
-        raise
-
+    concat_wavs([str(p) for p in chunk_paths], output_path)
+    if not output_path.exists():
+        raise RuntimeError(f"Concat completed but output file not found: {output_path}")
+    logging.info(f"Successfully combined audio chunks: {output_path}")
     return output_path
 
 

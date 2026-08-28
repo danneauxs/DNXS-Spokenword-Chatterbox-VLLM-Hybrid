@@ -121,16 +121,33 @@ def synthesize_chunk(
     chunks_json_path=None,
     override_voice_name=None,
     override_voice_path=None,
+    output_path=None,
 ):
-    """Generate one repair chunk with selected voice and stored TTS parameters.
+    """Generate one Repair-pipeline chunk with selected voice and stored parameters.
 
     Args:
-        override_voice_path: Resolved audio file selected by the repair GUI.
+        chunk: Full chunk record containing text, TTS parameters, and boundary.
+        index: Zero-based chunk index used by Repair naming and metadata.
+        book_name: Selected book name used only for fallback voice detection.
+        audio_dir: Book's normal ``audio_chunks`` directory.
+        revision: Use Repair's ``_rev`` filename when no explicit path is given.
+        chunks_json_path: Source chunks JSON used by fallback voice detection.
+        override_voice_name: User-selected voice label.
+        override_voice_path: Resolved audio file selected by the Repair GUI.
+        output_path: Optional explicit destination while retaining Repair synthesis.
+
+    Returns:
+        Absolute or relative path of the saved WAV, or ``None`` after a failure.
     """
-    filename = (
-        f"chunk_{index:05d}_rev.wav" if revision else f"chunk_{index:05d}.wav"
-    )
-    out_path = Path(audio_dir) / filename
+    if output_path is None:
+        filename = (
+            f"chunk_{index:05d}_rev.wav" if revision else f"chunk_{index:05d}.wav"
+        )
+        out_path = Path(audio_dir) / filename
+    else:
+        # Oregen needs its own files, but must execute this exact Repair path.
+        out_path = Path(output_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
         # Get device

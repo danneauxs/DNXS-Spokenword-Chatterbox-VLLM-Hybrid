@@ -49,6 +49,10 @@ CYAN = "\033[96m"
 # ============================================================================
 MAX_CHUNK_WORDS = 28
 MIN_CHUNK_WORDS = 4
+# word_cap = current behavior (honor max words, may split long sentences).
+# sentence_pack = Pocket-style: pack full sentences until min words, never
+# split mid-sentence, ignore max words (a sentence may overshoot min).
+CHUNKING_MODE = "word_cap"
 USE_TOKEN_CHUNKING = False  # If True, use token-based chunking instead of word-based to avoid EOS triggers
 USE_ORIGINAL_CHUNKING = True  # True = sentence/punctuation boundaries with boundary detection, False = 50-word simple chunking
 
@@ -99,7 +103,7 @@ VLLM_PP_USE_PROCESS_POOL = True   # Use process pool for CPU post-processing (vs
 # ASR VALIDATION SETTINGS
 # ============================================================================
 ASR_WORKERS = 4  # Parallel ASR on CPU threads
-DEFAULT_ASR_THRESHOLD = 0.75  # Default similarity threshold for ASR validation
+DEFAULT_ASR_THRESHOLD = 0.65
 
 # ============================================================================
 # AUDIO QUALITY SETTINGS
@@ -108,15 +112,33 @@ ENABLE_MID_DROP_CHECK = False
 ENABLE_ASR = False  # Disabled by default due to tensor dimension errors
 ASR_WORKERS = 4  # Parallel ASR on CPU threads
 DEFAULT_ASR_MODEL = "base"  # Default Whisper model for ASR validation
+# Two-stage ASR: Stage 1 scores every chunk; Stage 2 re-scores only Stage 1 fails.
+# Stage 2 "disabled" skips the independent verifier. Not written unless the user
+# enables ASR in the GUI; ENABLE_ASR stays False by default.
+ASR_STAGE1_MODEL = "parakeet-tdt-0.6b-v3"
+ASR_STAGE2_MODEL = "medium"
+# Stage 1: faster_whisper | whisper_cpp | parakeet. Stage 2: faster_whisper | whisper_cpp.
+ASR_STAGE1_BACKEND = "parakeet"
+ASR_STAGE2_BACKEND = "whisper_cpp"
+ASR_STAGE1_MODELS = (
+    "tiny",
+    "base",
+    "small",
+    "medium",
+    "large-v3",
+    "large-v3-turbo",
+    "distil-small.en",
+    "distil-medium.en",
+    "distil-large-v3",
+)
 # Tab 2 "Run ASR on GPU" checkbox default; off = safe CPU default. Saved by
 # save_config_to_file, which strips inline comments on this line -- keep the
 # explanation here, above the line, instead.
 ASR_USE_GPU = True
 
-# NOTE: ASR runs on CPU only (hardcoded in asr_daemon.py)
-# This prevents VRAM contention with TTS models and avoids OOM errors
-# CPU mode uses system RAM (~74 MB per worker) instead of competing for GPU VRAM
-# GPU mode is intentionally disabled during audiobook generation
+# ASR_USE_GPU requests CUDA. Each ASR result records the resolved runtime device,
+# because a backend can fall back to CPU. whisper.cpp specifically requires a
+# pywhispercpp build that contains libggml-cuda (ASR/install_pywhispercpp_cuda.sh).
 
 # ASR Model Memory Requirements (approximate)
 ASR_MODEL_VRAM_MB = {
@@ -197,14 +219,14 @@ SILENCE_SECTION_BREAK = 600
 SILENCE_PARAGRAPH_END = 1000
 
 # Punctuation-specific silence settings (milliseconds)
-SILENCE_COMMA = 120
-SILENCE_SEMICOLON = 150  # Medium pause after semicolons
-SILENCE_COLON = 150  # Pause after colons
-SILENCE_PERIOD = 400
-SILENCE_QUESTION_MARK = 650
-SILENCE_EXCLAMATION = 200
-SILENCE_DASH = 200  # Em dash pause
-SILENCE_ELLIPSIS = 80  # Ellipsis pause (suspense)
+SILENCE_COMMA = 0
+SILENCE_SEMICOLON = 0  # Mid-clause; keep 0 unless you accept a T3 split
+SILENCE_COLON = 0
+SILENCE_PERIOD = 300
+SILENCE_QUESTION_MARK = 350
+SILENCE_EXCLAMATION = 598
+SILENCE_DASH = 0  # Mid-clause; 0 = no T3 split
+SILENCE_ELLIPSIS = 0
 SILENCE_QUOTE_END = 150  # End of quoted speech
 
 # Chunk-level silence settings
@@ -231,17 +253,6 @@ PUNCTUATION_PAUSE_MAPPING = {
 ENABLE_PUNCTUATION_PAUSES = False
 
 # ============================================================================
-# INLINE PAUSES (Option A)
-# ============================================================================
-# Enable inline pause markers embedded in text (e.g., "~1", "~2").
-# When enabled, the TTS wrapper will parse these markers and insert configured
-# silences at those positions without splitting the chunk.
-ENABLE_INLINE_PAUSES = True
-INLINE_PAUSE_1_MS = 150  # "~1" → 150 ms
-INLINE_PAUSE_2_MS = 700  # "~2" → 300 ms
-
-
-# ============================================================================
 # AUDIO NORMALIZATION SETTINGS
 # ============================================================================
 ENABLE_NORMALIZATION = True
@@ -259,6 +270,14 @@ ATEMPO_SPEED = 1.0
 # M4B OUTPUT SETTINGS
 # ============================================================================
 M4B_SAMPLE_RATE = 24000
+# Encode only checked formats. M4B does not require a full-book WAV.
+WRITE_M4B = True
+WRITE_MP3 = False
+WRITE_WAV = False
+CHAPTERIZE = False
+# headings_only | headings_or_minutes | headings_with_max
+CHAPTER_MODE = "headings_only"
+MAX_CHAPTER_MINUTES = 0
 
 # ============================================================================
 # VLLM BACKEND SETTINGS
@@ -267,11 +286,181 @@ M4B_SAMPLE_RATE = 24000
 # Options: "cuda", "mps" (Apple Silicon), "cpu", or VLLM_DEVICE None/unset for auto-detect (cuda → mps → cpu)
 VLLM_DEVICE = os.getenv("VLLM_DEVICE")
 
-# Model variant. Options: "english" (faster), "multilingual" (supports multiple languages)
-VLLM_MODEL_VARIANT = "english"
+# T3 checkpoint source for turbo-hybrid Phase 1. Vocoder is always Turbo S3Gen.
+# Options:
+# - "english" / "standard" → t3_cfg.safetensors (original English T3, vLLM)
+# - "multilingual-v2"      → t3_mtl23ls_v2.safetensors (vLLM)
+# - "multilingual-v3"      → t3_mtl23ls_v3.safetensors (vLLM)
+# - "turbo"                → t3_turbo_v1.safetensors (native Turbo T3, not vLLM)
+T3_SOURCE = os.environ.get("CHATTERBOX_T3_SOURCE", "multilingual-v3").lower()
+
+# ISO language tag prepended as <lang> for multilingual T3. Ignored for english T3.
+T3_LANGUAGE = os.environ.get(
+    "CHATTERBOX_T3_LANGUAGE",
+    os.environ.get("VLLM_DEFAULT_LANGUAGE", "en"),
+).lower()
+
+T3_SOURCE_FILES = {
+    "english": "t3_cfg.safetensors",
+    "multilingual-v2": "t3_mtl23ls_v2.safetensors",
+    "multilingual-v3": "t3_mtl23ls_v3.safetensors",
+    "turbo": "t3_turbo_v1.safetensors",
+}
+
+_T3_SOURCE_ALIASES = {
+    "en": "english",
+    "eng": "english",
+    "english": "english",
+    "standard": "english",
+    "v2": "multilingual-v2",
+    "multilingual-v2": "multilingual-v2",
+    "mtl-v2": "multilingual-v2",
+    "v3": "multilingual-v3",
+    "multilingual": "multilingual-v3",
+    "multilingual-v3": "multilingual-v3",
+    "mtl-v3": "multilingual-v3",
+    "mtl": "multilingual-v3",
+    "turbo": "turbo",
+}
+
+# Directory holding multilingual V3 T3 weights (not VE/S3Gen).
+CHATTERBOX_MTL_CKPT_DIR = os.environ.get(
+    "CHATTERBOX_MTL_CKPT_DIR",
+    str(_APP_ROOT / "models" / "chatterbox-mtl-v3"),
+)
+
+# Directory holding multilingual V2 T3 weights when T3_SOURCE=multilingual-v2.
+CHATTERBOX_MTL_V2_CKPT_DIR = os.environ.get(
+    "CHATTERBOX_MTL_V2_CKPT_DIR",
+    str(_APP_ROOT / "models" / "chatterbox-mtl-v2"),
+)
+
+
+def resolve_t3_source(source=None):
+    """Normalize a T3 source string to english | multilingual-v2 | multilingual-v3 | turbo.
+
+    Args:
+        source: Optional raw source name or alias. None uses T3_SOURCE.
+
+    Returns:
+        Canonical T3 source name.
+
+    Raises:
+        ValueError: If the source is not a known alias.
+    """
+    raw = (source if source is not None else T3_SOURCE) or "multilingual-v3"
+    raw = str(raw).strip().lower()
+    resolved = _T3_SOURCE_ALIASES.get(raw)
+    if resolved is None:
+        known = ", ".join(sorted(set(_T3_SOURCE_ALIASES)))
+        raise ValueError(f"Unknown T3_SOURCE '{raw}'. Expected one of: {known}")
+    return resolved
+
+
+def t3_vllm_variant(source=None):
+    """Return the vLLM from_local variant string for a T3 source.
+
+    Args:
+        source: Optional T3 source. None uses T3_SOURCE.
+
+    Returns:
+        "english" or "multilingual".
+    """
+    src = resolve_t3_source(source)
+    if src == "english":
+        return "english"
+    if src == "turbo":
+        return "turbo"
+    return "multilingual"
+
+
+def t3_weights_filename(source=None):
+    """Return the T3 safetensors filename for a T3 source.
+
+    Args:
+        source: Optional T3 source. None uses T3_SOURCE.
+
+    Returns:
+        Checkpoint filename such as t3_mtl23ls_v3.safetensors.
+    """
+    return T3_SOURCE_FILES[resolve_t3_source(source)]
+
+
+def t3_checkpoint_dir(source=None):
+    """Return the directory that stores the T3 safetensors file for a source.
+
+    English T3 lives with VE/S3Gen under CHATTERBOX_CKPT_DIR. Multilingual T3
+    files live in their own dirs so Phase 0 can still load VE/S3Gen from the
+    English chatterbox folder.
+
+    Args:
+        source: Optional T3 source. None uses T3_SOURCE.
+
+    Returns:
+        Path to the T3 checkpoint directory.
+    """
+    src = resolve_t3_source(source)
+    if src == "english":
+        return Path(CHATTERBOX_CKPT_DIR)
+    if src == "multilingual-v2":
+        return Path(CHATTERBOX_MTL_V2_CKPT_DIR)
+    if src == "turbo":
+        return Path(os.environ.get("TURBO_CKPT_DIR", str(_APP_ROOT / "models" / "chatterbox-turbo")))
+    return Path(CHATTERBOX_MTL_CKPT_DIR)
+
+
+def vllm_t3_model_dir(source=None):
+    """Return the isolated one-weight vLLM directory for a T3 source.
+
+    Turbo T3 is not a vLLM model; callers must not use this for source=turbo.
+
+    Args:
+        source: Optional T3 source. None uses T3_SOURCE.
+
+    Returns:
+        Path to config.json + model.safetensors for vLLM.
+
+    Raises:
+        ValueError: If the source is turbo.
+    """
+    src = resolve_t3_source(source)
+    if src == "turbo":
+        return Path(
+            os.environ.get(
+                "VLLM_TURBO_CKPT_DIR",
+                str(_APP_ROOT / "models" / "vllm-t3-turbo"),
+            )
+        )
+    if src == "english":
+        return Path(VLLM_ENGLISH_CKPT_DIR or str(_APP_ROOT / "models" / "vllm-t3"))
+    if src == "multilingual-v2":
+        return Path(
+            os.environ.get(
+                "VLLM_MULTILINGUAL_V2_CKPT_DIR",
+                str(_APP_ROOT / "models" / "vllm-t3-mtl-v2"),
+            )
+        )
+    return Path(VLLM_MULTILINGUAL_CKPT_DIR or str(_APP_ROOT / "models" / "vllm-t3-mtl-v3"))
+
+
+def t3_weights_path(source=None):
+    """Return the full path to the T3 safetensors file for a source.
+
+    Args:
+        source: Optional T3 source. None uses T3_SOURCE.
+
+    Returns:
+        Path to the T3 weights file.
+    """
+    return t3_checkpoint_dir(source) / t3_weights_filename(source)
+
+
+# Derived from T3_SOURCE so existing variant=="english"|"multilingual" call sites
+# keep working. Override CHATTERBOX_T3_SOURCE rather than this name.
+VLLM_MODEL_VARIANT = t3_vllm_variant()
 
 # Default language code (e.g., "en", "es", "fr", "de", "zh")
-VLLM_DEFAULT_LANGUAGE = "en"
+VLLM_DEFAULT_LANGUAGE = T3_LANGUAGE
 
 # S3Gen diffusion steps - quality/speed tradeoff. Range: 1-50
 # Performance guide (per chunk):
@@ -304,8 +493,11 @@ VLLM_S3GEN_NUM_WORKERS = 0  # Number of worker threads (2 is safe for 8GB VRAM)
 # Override path to English model checkpoints (defaults to ./t3-model or ./chatterbox-vllm/t3-model)
 VLLM_ENGLISH_CKPT_DIR = os.environ.get("VLLM_ENGLISH_CKPT_DIR")
 
-# Override path to multilingual model checkpoints (defaults to ./t3-model-multilingual)
-VLLM_MULTILINGUAL_CKPT_DIR = os.environ.get("VLLM_MULTILINGUAL_CKPT_DIR")
+# Override path to multilingual model checkpoints (isolated one-weight vLLM dir)
+VLLM_MULTILINGUAL_CKPT_DIR = os.environ.get(
+    "VLLM_MULTILINGUAL_CKPT_DIR",
+    str(_APP_ROOT / "models" / "vllm-t3-mtl-v3"),
+)
 
 # ============================================================================
 # STANDARD TTS S3GEN SETTINGS (for token-to-audio conversion)
@@ -333,6 +525,9 @@ ENABLE_FP16_S3GEN = False
 # ============================================================================
 # Effective max context length for T3 (tokens). Used to clamp prompt length.
 MAX_T3_CONTEXT = 1200
+# vLLM forbids speech-stop until this many tokens per word (~half of 25Hz speech).
+# Stops T3 from ending a prompt at the first period. Do not disable stop tokens.
+T3_MIN_SPEECH_TOKENS_PER_WORD = 5
 
 # Enable Flash-Attention 2 for T3 backbone if available
 USE_FA2 = False
@@ -361,7 +556,7 @@ TURBO_S3GEN_BATCH_SIZE = 3
 TURBO_S3GEN_BATCH_CAPACITY = {2: 1400, 3: 1000}
 
 DEFAULT_EXAGGERATION = 0.5
-DEFAULT_CFG_WEIGHT = 0.5
+DEFAULT_CFG_WEIGHT = 0.4
 DEFAULT_TEMPERATURE = 0.85
 DEFAULT_SEED = 0  # Random seed for generation. 0 means random.
 

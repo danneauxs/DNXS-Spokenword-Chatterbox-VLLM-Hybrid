@@ -290,6 +290,7 @@ def emit_phase_status(
     total=None,
     phase_start_time=None,
     total_start_time=None,
+    extra=None,
 ):
     """Report phase-level progress (Phase 0/1/2/finalize) to the GUI status panel.
 
@@ -306,6 +307,7 @@ def emit_phase_status(
         total: Total items in this phase, if applicable.
         phase_start_time: time.time() when this phase began, for phase-elapsed.
         total_start_time: time.time() when the whole run began, for total-elapsed.
+        extra: Optional extra status keys (e.g. ASR stage elapsed labels).
     """
     def fmt(seconds):
         """Formats a seconds value as an H:MM:SS string."""
@@ -332,18 +334,35 @@ def emit_phase_status(
         status["phase1_elapsed"] = phase_elapsed
     elif phase == 2:
         status["phase2_elapsed"] = phase_elapsed
+    if extra:
+        status.update(extra)
 
     _relay_status(status)
 
 
-def emit_final_status(elapsed=None, audio=None, realtime=None, total_elapsed=None):
-    """Report the final "processing complete" summary to the GUI status panel."""
+def emit_final_status(
+    elapsed=None,
+    audio=None,
+    realtime=None,
+    realtime_total=None,
+    total_elapsed=None,
+):
+    """Report final completion stats to GUI, including both realtime ratios.
+
+    Args:
+        elapsed: Generation-span elapsed time string.
+        audio: Total rendered audio duration string.
+        realtime: Raw realtime ratio from audio duration divided by generation span.
+        realtime_total: Whole-run realtime ratio from audio duration divided by total wall time.
+        total_elapsed: Whole-run elapsed time string.
+    """
     _relay_status(
         {
             "operation": "✅ Processing Complete!",
             "elapsed": elapsed,
             "audio": audio,
             "realtime": realtime,
+            "realtime_total": realtime_total,
             "remaining": "0:00:00",
             "total_elapsed": total_elapsed,
         }
