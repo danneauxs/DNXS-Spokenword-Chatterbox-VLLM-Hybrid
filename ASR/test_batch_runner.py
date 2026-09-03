@@ -10,7 +10,12 @@ from unittest.mock import patch
 
 import numpy as np
 
-from ASR.batch_runner import ASRBatchConfig, run_asr_batch, run_asr_batch_isolated
+from ASR.batch_runner import (
+    ASRBatchConfig,
+    _result_from_transcript,
+    run_asr_batch,
+    run_asr_batch_isolated,
+)
 
 
 class _Segment:
@@ -34,8 +39,9 @@ class _WhisperModel:
 class _ParakeetModel:
     """Parakeet-compatible fake exposing the production multi-file method."""
 
-    def transcribe_many(self, audio_paths):
-        """Return one correct transcript for every requested path."""
+    def transcribe_many(self, audio_paths, batch_size):
+        """Return one correct transcript for every requested path and batch size."""
+        assert batch_size > 0
         return ["hello" for _ in audio_paths]
 
 
@@ -51,6 +57,31 @@ def _task(chunk_id: str, wav_path: Path) -> dict:
 
 class BatchRunnerTests(unittest.TestCase):
     """Exercise supported engine/device dispatch without heavyweight ASR models."""
+
+    def test_transcript_rows_preserve_boundary_policy_evidence(self):
+        """Forward comparator version and boundary operations into report-ready rows."""
+        row = _result_from_transcript(
+            {
+                "chunk_id": "5924",
+                "expected_text": "Never mind that.",
+                "threshold": 0.99,
+            },
+            "Nevermind that.",
+            "parakeet",
+            "cuda",
+        )
+
+        self.assertTrue(row["passed"])
+        self.assertEqual(row["comparison_policy_version"], "boundary-resegmentation-v2")
+        self.assertTrue(any(
+            item["op"] == "boundary_resegmentation"
+            and item.get("boundary_method") == "exact_surface"
+            for item in row["alignment_operations"]
+        ))
+        self.assertTrue(any(
+            item.get("kind") == "boundary_resegmentation"
+            for item in row["accepted_phrase_equivalences"]
+        ))
 
     def test_cpu_engine_paths_preserve_selected_backend_and_score(self):
         """CPU Faster-Whisper, CPP, and Parakeet return scored rows for all tasks."""

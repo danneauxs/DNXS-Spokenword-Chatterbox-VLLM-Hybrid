@@ -325,15 +325,16 @@ def regenerate_failed_chunks(
     batch_processor = VllmBatchProcessor(
         ckpt_dir=ckpt_dir, target_device=device, variant=variant
     )
-
-    attempts_by_chunk = _generate_regeneration_tokens_batched(
-        batch_processor=batch_processor,
-        failed=failed,
-        max_attempts=max_attempts,
-        cond_emb=cond_emb,
-    )
-
-    batch_processor.shutdown()
+    try:
+        attempts_by_chunk = _generate_regeneration_tokens_batched(
+            batch_processor=batch_processor,
+            failed=failed,
+            max_attempts=max_attempts,
+            cond_emb=cond_emb,
+        )
+    finally:
+        # Retry token generation must release T3 before decoder/ASR can load.
+        batch_processor.shutdown()
 
     # Phase 2B: reload the decoder just for these attempts' decode.
     decoder = VllmDecoder(
@@ -347,26 +348,28 @@ def regenerate_failed_chunks(
     failed_dir = audio_output_dir / "Failed"
     decoded_by_chunk: Dict = {}
 
-    for item in failed:
-        chunk_id = item["chunk_id"]
-        chunk_id_str = f"{int(chunk_id):05d}"
-        pauses = item.get("pauses", [])
-        boundary_type = item.get("boundary_type", "none")
-        decoded_attempts = []
-        for attempt_num, adj_params, token_lists in attempts_by_chunk[chunk_id]:
-            attempt_label = f"chunk_{chunk_id_str}_attempt{attempt_num}"
-            audio, _debug = decoder.decode_and_assemble_chunk(
-                token_lists, pauses, boundary_type, chunk_label=attempt_label
-            )
-            if audio is None:
-                continue
-            attempt_path = audio_output_dir / f"{attempt_label}.wav"
-            audio.export(str(attempt_path), format="wav")
-            asr_key = f"{chunk_id}_r{attempt_num}"
-            decoded_attempts.append((attempt_num, attempt_path, audio, asr_key))
-        decoded_by_chunk[chunk_id] = decoded_attempts
-
-    decoder.shutdown()
+    try:
+        for item in failed:
+            chunk_id = item["chunk_id"]
+            chunk_id_str = f"{int(chunk_id):05d}"
+            pauses = item.get("pauses", [])
+            boundary_type = item.get("boundary_type", "none")
+            decoded_attempts = []
+            for attempt_num, adj_params, token_lists in attempts_by_chunk[chunk_id]:
+                attempt_label = f"chunk_{chunk_id_str}_attempt{attempt_num}"
+                audio, _debug = decoder.decode_and_assemble_chunk(
+                    token_lists, pauses, boundary_type, chunk_label=attempt_label
+                )
+                if audio is None:
+                    continue
+                attempt_path = audio_output_dir / f"{attempt_label}.wav"
+                audio.export(str(attempt_path), format="wav")
+                asr_key = f"{chunk_id}_r{attempt_num}"
+                decoded_attempts.append((attempt_num, attempt_path, audio, asr_key))
+            decoded_by_chunk[chunk_id] = decoded_attempts
+    finally:
+        # Decoder memory must be gone before the isolated retry ASR child starts.
+        decoder.shutdown()
     try:
         import gc as _gc
         import torch as _torch

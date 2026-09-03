@@ -17,12 +17,14 @@ try:
         NUMERIC_SLOT,
         replace_spoken_number_spans,
         separate_attached_measure_units,
+        separate_numeric_compound_surfaces,
     )
 except ImportError:  # Supports direct execution from the ASR directory.
     from numeric_slots import (
         NUMERIC_SLOT,
         replace_spoken_number_spans,
         separate_attached_measure_units,
+        separate_numeric_compound_surfaces,
     )
 
 # Compiled patterns
@@ -57,10 +59,45 @@ _D_CONTRACTION_WITH_FOLLOWING_RE = re.compile(
 )
 _LEXICAL_POSSESSIVE_RE = re.compile(r"\b([a-z]{3,})'s\b", re.IGNORECASE)
 _RAW_SPOKEN_TOKEN_RE = re.compile(r"[A-Za-z]+(?:['\u2019][A-Za-z]+)?|\d+")
+_ASR_TERMINAL_DIAGNOSTIC_RE = re.compile(
+    r"(?:\s*\[BLANK_AUDIO\])+(?:\s*[.?!,;:]*)$", re.IGNORECASE
+)
 _UPPER_ROMAN_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9])([IVXLCDM]{2,})(?![A-Za-z0-9])")
 _BOOK_TERM_RE = re.compile(r"\b[A-Za-z][A-Za-z']*\b")
 _ACRONYM_POSSESSIVE_RE = re.compile(r"\b([A-Z]{2,})['\u2019]s\b")
 _RAW_SHORT_ACRONYM_RE = re.compile(r"(?<![A-Za-z0-9])([A-Z]{2,4})(?![A-Za-z0-9])")
+_TIME_DIGIT_WORDS = {
+    "zero": 0,
+    "oh": 0,
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+}
+_TIME_TENS_WORDS = {
+    "ten": 10,
+    "twenty": 20,
+    "thirty": 30,
+    "forty": 40,
+    "fifty": 50,
+}
+_TIME_SPOKEN_SEQUENCE_RE = re.compile(
+    r"(?<!\w)(?P<lead>zero|oh|one|two|three|four|five|six|seven|eight|nine)\s+"
+    r"(?P<hour>zero|oh|one|two|three|four|five|six|seven|eight|nine)\s+"
+    r"(?P<minute>ten|twenty|thirty|forty|fifty)\s+"
+    r"(?P<unit>hours?)\b",
+    re.IGNORECASE,
+)
+_TIME_NUMERIC_TO_RE = re.compile(
+    r"(?<!\w)(?P<lead>\d{1,2})\s+to\s+(?P<minute>\d{1,2})\s+"
+    r"(?P<unit>hours?)\b",
+    re.IGNORECASE,
+)
 
 DEFAULT_VALIDATION_CONFIG: Dict[str, Any] = {
     "pass_threshold": 0.88,
@@ -84,6 +121,11 @@ ROMAN_TO_INT = {
 # "dc" is Washington DC / geo acronym, not Roman 600. Keep other short
 # letter-strings convertible only when they are true numerals in context.
 ROMAN_BLOCKLIST = {"liv", "dc"}
+_ROMAN_CONTEXT_WORDS = frozenset({
+    "act", "book", "chapter", "episode", "level", "part", "phase",
+    "section", "season", "series", "stage", "volume", "vol",
+})
+_ROMAN_SUBTRACTIVE_PAIRS = frozenset({"iv", "ix", "xl", "xc", "cd", "cm"})
 
 NEGATIONS = frozenset({"not", "no", "never", "cannot", "dont", "doesnt", "didnt", "wont", "isnt", "wasnt", "werent"})
 PERSONAL_PRONOUNS = frozenset({"i", "me", "he", "him", "she", "her", "we", "us", "they", "them", "you"})
@@ -265,6 +307,7 @@ _SPLIT_WORD_DIGIT_WORDS = frozenset({
 SPELLING_VARIANTS = {
     "blond": "blond", "blonde": "blond",
     "toward": "toward", "towards": "toward", "tooward": "toward",
+    "tward": "toward",
     "dr": "doctor",
     "mister": "mister",
     "mr": "mister",
@@ -279,6 +322,7 @@ SPELLING_VARIANTS = {
     "ha": "ha", "hah": "ha", "haw": "ha",
     "uhoh": "uh",
     "kinda": "kind of", "gonna": "going to", "wanna": "want to", "gotta": "got to",
+    "gimme": "give me",
     "oh": "uh", "o": "uh", "uh": "uh", "uhh": "uh", "um": "uh", "umm": "uh",
     "er": "uh", "erm": "uh", "ah": "uh", "eh": "uh", "hmm": "uh",
     "hmmm": "uh", "mm": "uh", "mmm": "uh", "huh": "uh",
@@ -411,10 +455,95 @@ _BLOCKED_PHONETIC_PAIRS = {
     frozenset({"mynoot", "minit"}),
 }
 _RULES_PATH = Path(__file__).with_name("spoken_compare_rules.json")
+_HOMOGRAPH_WHITELIST_PATH = (
+    Path(__file__).resolve().parents[1] / "config" / "asr_homograph_whitelist.json"
+)
+_HOMOGRAPH_WHITELIST_PAIRS: Set[Tuple[Tuple[str, ...], Tuple[str, ...]]] = set()
+
+
+def _homograph_phrase_tokens(value: Any) -> Tuple[str, ...]:
+    """Normalize one config phrase into the comparator's whitespace token surface.
+
+    Args:
+        value: Config value containing one editable pronunciation surface.
+
+    Returns:
+        Lowercase alphanumeric tokens, or an empty tuple for invalid input.
+    """
+    if not isinstance(value, str):
+        return ()
+    tokens = []
+    for item in value.casefold().split():
+        clean = re.sub(r"[^a-z0-9]", "", item)
+        if clean:
+            tokens.append(clean)
+    return tuple(tokens)
+
+
+def _homograph_pair_key(
+    left: Sequence[str],
+    right: Sequence[str],
+) -> Optional[Tuple[Tuple[str, ...], Tuple[str, ...]]]:
+    """Return one order-independent key for two normalized homograph forms.
+
+    Args:
+        left: First normalized pronunciation surface.
+        right: Second normalized pronunciation surface.
+
+    Returns:
+        Stable pair key, or ``None`` when either surface is empty or identical.
+    """
+    left_key = tuple(left)
+    right_key = tuple(right)
+    if not left_key or not right_key or left_key == right_key:
+        return None
+    return (left_key, right_key) if left_key < right_key else (right_key, left_key)
+
+
+def _parse_homograph_whitelist(raw_rules: Any) -> Set[Tuple[Tuple[str, ...], Tuple[str, ...]]]:
+    """Parse exact editable homograph groups into supported comparator pair keys.
+
+    Only one-to-one, one-to-two, and one-to-three forms are admitted because
+    those are the bounded alignment shapes that can preserve local content.
+
+    Args:
+        raw_rules: Decoded whitelist object or its homograph entry list.
+
+    Returns:
+        Set of order-independent normalized pronunciation pair keys.
+    """
+    pairs: Set[Tuple[Tuple[str, ...], Tuple[str, ...]]] = set()
+    if isinstance(raw_rules, dict):
+        entries = raw_rules.get("homograph_whitelist")
+    else:
+        entries = raw_rules
+    if not isinstance(entries, list):
+        return pairs
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        canonical = _homograph_phrase_tokens(entry.get("canonical"))
+        equivalents = entry.get("equivalents")
+        if not canonical or not isinstance(equivalents, list):
+            continue
+        forms = [canonical]
+        forms.extend(
+            phrase
+            for phrase in (_homograph_phrase_tokens(item) for item in equivalents)
+            if phrase
+        )
+        for index, left in enumerate(forms):
+            for right in forms[index + 1:]:
+                if {len(left), len(right)} not in ({1}, {1, 2}, {1, 3}):
+                    continue
+                pair = _homograph_pair_key(left, right)
+                if pair is not None:
+                    pairs.add(pair)
+    return pairs
 
 
 def _default_spoken_rules() -> Dict[str, Any]:
-    """Return built-in spoken-rule defaults used when file is absent."""
+    """Return built-in spoken-rule defaults used when files are absent."""
     return {
         "spelling_variants": dict(SPELLING_VARIANTS),
         "phonetic_map": dict(_PHONETIC_MAP),
@@ -422,12 +551,23 @@ def _default_spoken_rules() -> Dict[str, Any]:
         "negations": sorted(NEGATIONS),
         "blocked_phonetic_pairs": [sorted(pair) for pair in _BLOCKED_PHONETIC_PAIRS],
         "placeholder_prefixes": list(_PLACEHOLDER_PREFIXES),
+        "homograph_whitelist": [],
     }
 
 
-def _merge_spoken_rules(raw_rules: Any) -> Dict[str, Any]:
-    """Merge file-backed overrides onto built-in spoken defaults."""
+def _merge_spoken_rules(raw_rules: Any, homograph_rules: Any = None) -> Dict[str, Any]:
+    """Merge comparator rules and the separate config-folder homograph whitelist.
+
+    Args:
+        raw_rules: Decoded legacy comparator-rules object.
+        homograph_rules: Decoded config-folder whitelist object.
+
+    Returns:
+        Merged rule dictionary ready for module-global installation.
+    """
     rules = _default_spoken_rules()
+    if isinstance(homograph_rules, dict):
+        rules["homograph_whitelist"] = homograph_rules.get("homograph_whitelist", [])
     if not isinstance(raw_rules, dict):
         return rules
 
@@ -484,6 +624,7 @@ def _apply_spoken_rules(rules: Dict[str, Any]) -> None:
     global NEGATIONS
     global _BLOCKED_PHONETIC_PAIRS
     global _PLACEHOLDER_PREFIXES
+    global _HOMOGRAPH_WHITELIST_PAIRS
 
     SPELLING_VARIANTS = dict(rules["spelling_variants"])
     _PHONETIC_MAP = dict(rules["phonetic_map"])
@@ -491,6 +632,7 @@ def _apply_spoken_rules(rules: Dict[str, Any]) -> None:
     NEGATIONS = frozenset(rules["negations"])
     _BLOCKED_PHONETIC_PAIRS = {frozenset(pair) for pair in rules["blocked_phonetic_pairs"]}
     _PLACEHOLDER_PREFIXES = tuple(rules["placeholder_prefixes"])
+    _HOMOGRAPH_WHITELIST_PAIRS = _parse_homograph_whitelist(rules["homograph_whitelist"])
 
 
 def reload_spoken_rules() -> Dict[str, Any]:
@@ -499,7 +641,11 @@ def reload_spoken_rules() -> Dict[str, Any]:
         raw = json.loads(_RULES_PATH.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError):
         raw = None
-    rules = _merge_spoken_rules(raw)
+    try:
+        homograph_raw = json.loads(_HOMOGRAPH_WHITELIST_PATH.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        homograph_raw = None
+    rules = _merge_spoken_rules(raw, homograph_rules=homograph_raw)
     _apply_spoken_rules(rules)
     return rules
 
@@ -877,6 +1023,65 @@ def _typed_identifier_span_length(tokens: Sequence[str], start: int) -> int:
     return 3
 
 
+def _spoken_numeric_code_surface(
+    tokens: Sequence[str],
+    start: int,
+) -> Optional[Dict[str, Any]]:
+    """Detect a spoken digit-plus-letter code such as ``eight cee``.
+
+    Compact ASR output may render ``8C`` as a numeral followed by a spoken
+    letter name. This recognizes that general two-component code shape while
+    excluding ambiguous digit words such as ``oh`` that commonly belong to
+    spoken numeric sequences.
+
+    Args:
+        tokens: Whitespace-tokenized surface text.
+        start: Candidate first-token index.
+
+    Returns:
+        Identifier context and span length when the candidate is code-like;
+        otherwise ``None``.
+    """
+    if start + 1 >= len(tokens):
+        return None
+    first_clean, first_kind = _identifier_piece_info(tokens[start])
+    if first_kind != "number":
+        return None
+    second_raw, _ = _identifier_surface_token(tokens[start + 1])
+    second_clean = _clean_context_word(second_raw)
+    if (
+        not second_clean
+        or second_clean in _IDENTIFIER_NUMBER_WORDS
+        or second_clean in FUNCTION_WORDS
+        or second_clean in PERSONAL_PRONOUNS
+        or second_clean in NEGATIONS
+    ):
+        return None
+    letter = _spoken_letter_alias(second_clean)
+    if not letter or len(letter) != 1:
+        return None
+    components = [_canonical_identifier_piece(first_clean), letter]
+    return {
+        "span_len": 2,
+        "context": {
+            "placeholder": "",
+            "canonical_id": "".join(components),
+            "components": components,
+            "kind": "identifier",
+            "words_before": [
+                _clean_context_word(token)
+                for token in tokens[max(0, start - 2):start]
+                if _clean_context_word(token)
+            ],
+            "words_after": [
+                _clean_context_word(token)
+                for token in tokens[start + 2:min(len(tokens), start + 4)]
+                if _clean_context_word(token)
+            ],
+        },
+    }
+
+
 def _replace_typed_identifier_spans(text: str) -> Tuple[str, List[Dict[str, Any]]]:
     """Replace typed identifier spans with slots while keeping prose intact."""
     if not text:
@@ -887,6 +1092,16 @@ def _replace_typed_identifier_spans(text: str) -> Tuple[str, List[Dict[str, Any]
     id_contexts: List[Dict[str, Any]] = []
     i = 0
     while i < len(tokens):
+        spoken_code = _spoken_numeric_code_surface(tokens, i)
+        if spoken_code:
+            span_len = int(spoken_code["span_len"])
+            placeholder = f"<TID{len(id_contexts)}>"
+            out_tokens.append(placeholder)
+            context = dict(spoken_code["context"])
+            context["placeholder"] = placeholder
+            id_contexts.append(context)
+            i += span_len
+            continue
         punctuated = _punctuated_identifier_surface(tokens, i)
         if punctuated:
             span_len = int(punctuated["span_len"])
@@ -1111,6 +1326,353 @@ def _raw_token_difference(
     return ref_matches, hyp_matches, prefix, ref_end, hyp_end
 
 
+def _raw_time_two_to_equivalence(
+    ref_text: str,
+    hyp_text: str,
+) -> Tuple[Optional[Dict[str, Any]], str, str]:
+    """Align a time-like ``two`` sequence with ASR's ``to`` rendering.
+
+    In military-style time speech, a source sequence such as ``zero two
+    thirty hours`` can be transcribed as ``0 to 30 hours``. The source-side
+    numeric sequence and the hypothesis-side range are both required, and the
+    source's middle component must literally be ``two``. Ordinary ranges such
+    as ``twenty to thirty hours`` therefore remain untouched.
+
+    Args:
+        ref_text: Source text before normalization.
+        hyp_text: ASR text before normalization.
+
+    Returns:
+        Evidence plus rewritten text when one guarded time variant is found;
+        otherwise ``(None, ref_text, hyp_text)``.
+    """
+    ref_matches = list(_TIME_SPOKEN_SEQUENCE_RE.finditer(ref_text or ""))
+    hyp_matches = list(_TIME_NUMERIC_TO_RE.finditer(hyp_text or ""))
+    if len(ref_matches) != 1 or len(hyp_matches) != 1:
+        return None, ref_text, hyp_text
+
+    ref_match = ref_matches[0]
+    hyp_match = hyp_matches[0]
+    if ref_match.group("hour").lower() != "two":
+        return None, ref_text, hyp_text
+    lead_value = _TIME_DIGIT_WORDS[ref_match.group("lead").lower()]
+    minute_value = _TIME_TENS_WORDS[ref_match.group("minute").lower()]
+    if int(hyp_match.group("lead")) != lead_value:
+        return None, ref_text, hyp_text
+    if int(hyp_match.group("minute")) != minute_value:
+        return None, ref_text, hyp_text
+
+    ref_surface = ref_match.group(0)
+    hyp_surface = hyp_match.group(0)
+    rewritten_ref = (
+        f"{ref_text[:ref_match.start()]}{hyp_surface}"
+        f"{ref_text[ref_match.end():]}"
+    )
+    return (
+        {
+            "kind": "time_two_to_surface_variation",
+            "expected": ref_surface,
+            "hypothesis": hyp_surface,
+        },
+        rewritten_ref,
+        hyp_text,
+    )
+
+
+def _raw_formatting_equivalence(
+    ref_text: str,
+    hyp_text: str,
+) -> Optional[Dict[str, Any]]:
+    """Recognize transcripts differing only by capitalization or punctuation.
+
+    This intentionally retains apostrophes inside words.  It accepts only an
+    identical complete raw word sequence, so punctuation changes cannot invoke
+    later surface-rewrite rules and move a repeated word to another position.
+    """
+    ref_tokens = [
+        match.group(0).lower().replace("\u2019", "'")
+        for match in _RAW_SPOKEN_TOKEN_RE.finditer(ref_text or "")
+    ]
+    hyp_tokens = [
+        match.group(0).lower().replace("\u2019", "'")
+        for match in _RAW_SPOKEN_TOKEN_RE.finditer(hyp_text or "")
+    ]
+    if ref_tokens and ref_tokens == hyp_tokens and ref_text != hyp_text:
+        return {
+            "kind": "raw_formatting_equivalence",
+            "expected": ref_text,
+            "hypothesis": hyp_text,
+        }
+    return None
+
+
+def _raw_normalized_equivalence(
+    ref_text: str,
+    hyp_text: str,
+    canon_lookup: Optional[dict],
+) -> Optional[Dict[str, Any]]:
+    """Recognize complete equality under the ordinary safe normalizer.
+
+    This check occurs before optional raw repair rules.  If the canonical
+    spoken sequence already agrees, applying a structural rewrite adds no
+    information and risks choosing the wrong repeated occurrence.
+    """
+    ref_normalized, _ = normalize(ref_text, canon_lookup)
+    hyp_normalized, _ = normalize(hyp_text, canon_lookup)
+    if ref_normalized and ref_normalized == hyp_normalized and ref_text != hyp_text:
+        return {
+            "kind": "raw_normalized_equivalence",
+            "expected": ref_text,
+            "hypothesis": hyp_text,
+        }
+    return None
+
+
+def _raw_reduced_pronoun_equivalence(
+    ref_text: str,
+    hyp_text: str,
+) -> Optional[Dict[str, Any]]:
+    """Accept source ``'em`` when ASR writes the acoustically close ``him``.
+
+    The complete raw token streams must otherwise agree position-for-position;
+    this is a pronunciation rule for the reduced object pronoun, never a
+    general ``them``/``him`` substitution.
+    """
+    ref_matches = list(_RAW_SPOKEN_TOKEN_RE.finditer(ref_text or ""))
+    hyp_matches = list(_RAW_SPOKEN_TOKEN_RE.finditer(hyp_text or ""))
+    if not ref_matches or len(ref_matches) != len(hyp_matches):
+        return None
+    variations: List[Tuple[str, str]] = []
+    for ref_match, hyp_match in zip(ref_matches, hyp_matches):
+        ref_token = ref_match.group(0).lower().replace("\u2019", "'")
+        hyp_token = hyp_match.group(0).lower().replace("\u2019", "'")
+        if ref_token == hyp_token:
+            continue
+        if (ref_token, hyp_token) != ("em", "him"):
+            return None
+        variations.append((ref_match.group(0), hyp_match.group(0)))
+    if not variations:
+        return None
+    return {
+        "kind": "reduced_pronoun_equivalence",
+        "expected": "'em",
+        "hypothesis": "him",
+        "count": len(variations),
+    }
+
+
+def _raw_call_sign_article_equivalence(
+    ref_text: str,
+    hyp_text: str,
+) -> Optional[Dict[str, Any]]:
+    """Accept ASR's article before a capitalized two-word call sign.
+
+    Source dialogue often writes ``You're Low Boy`` as a call sign, while ASR
+    may insert an orthographic ``a`` before the same spoken title.  Require a
+    second capitalized source word and an otherwise exact raw sequence; this
+    cannot hide a general added article in ordinary prose.
+    """
+    ref_matches = list(_RAW_SPOKEN_TOKEN_RE.finditer(ref_text or ""))
+    hyp_matches = list(_RAW_SPOKEN_TOKEN_RE.finditer(hyp_text or ""))
+    if len(hyp_matches) != len(ref_matches) + 1:
+        return None
+    for hyp_index, hyp_match in enumerate(hyp_matches):
+        if hyp_match.group(0).lower() != "a" or hyp_index < 1:
+            continue
+        ref_index = hyp_index
+        if ref_index + 1 >= len(ref_matches):
+            continue
+        prior = ref_matches[ref_index - 1].group(0).lower().replace("\u2019", "'")
+        if prior not in {"you're", "youre"}:
+            continue
+        title = [ref_matches[ref_index].group(0), ref_matches[ref_index + 1].group(0)]
+        if not all(word[:1].isupper() for word in title):
+            continue
+        without_article = [
+            match.group(0).lower().replace("\u2019", "'")
+            for index, match in enumerate(hyp_matches)
+            if index != hyp_index
+        ]
+        ref_tokens = [
+            match.group(0).lower().replace("\u2019", "'")
+            for match in ref_matches
+        ]
+        if without_article == ref_tokens:
+            return {
+                "kind": "call_sign_article_equivalence",
+                "expected": " ".join(title),
+                "hypothesis": f"a {title[0]} {title[1]}",
+            }
+    return None
+
+
+def _raw_slash_name_equivalence(
+    ref_text: str,
+    hyp_text: str,
+    canon_lookup: Optional[dict],
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    """Separate one slash-joined personal name when ASR speaks two words.
+
+    A slash is occasionally used in source prose to join a surname pair.  This
+    does not apply to compact codes: both source components must be alphabetic
+    name-sized words, the surname must match exactly, and the full rewritten
+    utterance must normalize identically to ASR.
+    """
+    pattern = re.compile(
+        r"(?<![A-Za-z])([A-Za-z]{3,}(?:['\u2019][A-Za-z]+)?)/([A-Za-z]{3,})(?![A-Za-z])"
+    )
+    matches = list(pattern.finditer(ref_text or ""))
+    if len(matches) != 1:
+        return None, ref_text
+    source = matches[0]
+    left = _clean_context_word(source.group(1))
+    right = _clean_context_word(source.group(2))
+    hyp_tokens = list(_RAW_SPOKEN_TOKEN_RE.finditer(hyp_text or ""))
+    candidates = []
+    for index in range(len(hyp_tokens) - 1):
+        hyp_left = _clean_context_word(hyp_tokens[index].group(0))
+        hyp_right = _clean_context_word(hyp_tokens[index + 1].group(0))
+        if (
+            hyp_right == right
+            and tokens_phonetically_equal(left, hyp_left)
+        ):
+            candidates.append((hyp_tokens[index].group(0), hyp_tokens[index + 1].group(0)))
+    if len(candidates) != 1:
+        return None, ref_text
+    replacement = " ".join(candidates[0])
+    rewritten = f"{ref_text[:source.start()]}{replacement}{ref_text[source.end():]}"
+    rewritten_tokens = [match.group(0) for match in _RAW_SPOKEN_TOKEN_RE.finditer(rewritten)]
+    hypothesis_tokens = [match.group(0) for match in _RAW_SPOKEN_TOKEN_RE.finditer(hyp_text)]
+    if not rewritten_tokens or not hypothesis_tokens:
+        return None, ref_text
+    # Compare the remaining stream in local spans.  Whole-utterance normalize
+    # can itself be affected by the slash form; a changed span is accepted only
+    # when the ordinary numeric normalizer proves those local words equivalent.
+    for tag, ref_start, ref_end, hyp_start, hyp_end in SequenceMatcher(
+        None,
+        [token.lower() for token in rewritten_tokens],
+        [token.lower() for token in hypothesis_tokens],
+        autojunk=False,
+    ).get_opcodes():
+        if tag == "equal":
+            continue
+        ref_span = " ".join(rewritten_tokens[ref_start:ref_end])
+        hyp_span = " ".join(hypothesis_tokens[hyp_start:hyp_end])
+        ref_normalized, _ = normalize(ref_span, canon_lookup)
+        hyp_normalized, _ = normalize(hyp_span, canon_lookup)
+        if ref_normalized and ref_normalized == hyp_normalized:
+            continue
+        # Event-style proper labels can be rendered with a spurious apostrophe
+        # before their number (``Expo Seventy-Four`` -> ``Expo's 74``).  The
+        # source label must be capitalized and the remaining number span must
+        # independently normalize exactly, so ordinary possessive prose stays
+        # outside this rule.
+        ref_part = rewritten_tokens[ref_start:ref_end]
+        hyp_part = hypothesis_tokens[hyp_start:hyp_end]
+        if (
+            len(ref_part) >= 2
+            and len(hyp_part) >= 2
+            and ref_part[0][0].isupper()
+            and hyp_part[0].lower().replace("\u2019", "'")
+            == f"{ref_part[0].lower()}'s"
+            and normalize(" ".join(ref_part[1:]), canon_lookup)[0]
+            == normalize(" ".join(hyp_part[1:]), canon_lookup)[0]
+        ):
+            continue
+        return None, ref_text
+    return (
+        {
+            "kind": "slash_joined_name_equivalence",
+            "expected": source.group(0),
+            "hypothesis": replacement,
+        },
+        rewritten,
+    )
+
+
+def _raw_spoken_code_equivalence(
+    ref_text: str,
+    hyp_text: str,
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    """Render a spoken two-part letter-number code in ASR's compact form.
+
+    The rule is structural: each source number must be an English cardinal
+    from zero through ninety-nine, both leading letters must agree, and ASR
+    must contain the same two digit values.  It cannot accept a changed code.
+    """
+    word_to_number = {
+        re.sub(r"[- ]", "", num2words(value, lang="en").lower()): value
+        for value in range(100)
+    }
+    source_pattern = re.compile(
+        r"(?<![A-Za-z0-9])([A-Za-z])[- ]([A-Za-z-]+)\s*/\s*([A-Za-z])[- ]([A-Za-z-]+)(?![A-Za-z0-9])"
+    )
+    hyp_pattern = re.compile(
+        r"(?<![A-Za-z0-9])([A-Za-z])(\d+)\s*[-/]\s*([A-Za-z])(\d+)(?![A-Za-z0-9])"
+    )
+    source_matches = list(source_pattern.finditer(ref_text or ""))
+    hyp_matches = list(hyp_pattern.finditer(hyp_text or ""))
+    if len(source_matches) != 1 or len(hyp_matches) != 1:
+        return None, ref_text
+    source = source_matches[0]
+    hypothesis = hyp_matches[0]
+    source_numbers = [
+        word_to_number.get(re.sub(r"[- ]", "", source.group(index).lower()))
+        for index in (2, 4)
+    ]
+    if (
+        None in source_numbers
+        or source.group(1).lower() != hypothesis.group(1).lower()
+        or source.group(3).lower() != hypothesis.group(3).lower()
+        or source_numbers != [int(hypothesis.group(2)), int(hypothesis.group(4))]
+    ):
+        return None, ref_text
+    replacement = hypothesis.group(0)
+    rewritten = f"{ref_text[:source.start()]}{replacement}{ref_text[source.end():]}"
+    return (
+        {
+            "kind": "spoken_letter_number_code_equivalence",
+            "expected": source.group(0),
+            "hypothesis": replacement,
+        },
+        rewritten,
+    )
+
+
+def _raw_lowercase_n_conjunction_equivalence(
+    ref_text: str,
+    hyp_text: str,
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    """Expand prose ``n`` to ``and`` only when every other raw token agrees."""
+    ref_matches = list(_RAW_SPOKEN_TOKEN_RE.finditer(ref_text or ""))
+    hyp_matches = list(_RAW_SPOKEN_TOKEN_RE.finditer(hyp_text or ""))
+    if not ref_matches or len(ref_matches) != len(hyp_matches):
+        return None, ref_text
+    replacements: List[Tuple[int, int, str]] = []
+    for ref_match, hyp_match in zip(ref_matches, hyp_matches):
+        ref_token = ref_match.group(0)
+        hyp_token = hyp_match.group(0)
+        if ref_token.lower() == hyp_token.lower():
+            continue
+        if ref_token != "n" or hyp_token.lower() != "and":
+            return None, ref_text
+        replacements.append((ref_match.start(), ref_match.end(), hyp_token))
+    if not replacements:
+        return None, ref_text
+    rewritten = ref_text
+    for start, end, replacement in reversed(replacements):
+        rewritten = f"{rewritten[:start]}{replacement}{rewritten[end:]}"
+    return (
+        {
+            "kind": "reduced_conjunction_equivalence",
+            "expected": "n",
+            "hypothesis": "and",
+            "count": len(replacements),
+        },
+        rewritten,
+    )
+
+
 def _raw_lexical_possessive_filler_equivalence(
     ref_text: str,
     hyp_text: str,
@@ -1189,11 +1751,206 @@ def _raw_lexical_possessive_filler_equivalence(
     )
 
 
+def _raw_compact_boundary_surface_equivalences(
+    ref_text: str,
+    hyp_text: str,
+    phonetic_threshold: float = 0.85,
+) -> Tuple[List[Dict[str, Any]], str, str]:
+    """Align every anchored compact word-boundary variation before number slots.
+
+    This compares only one-to-two/three raw spans whose compact surfaces are
+    identical, or whose hyphen/apostrophe-bearing surface is strongly phonetic.
+    It runs before number parsing so ``sixpack`` and ``six-pack`` retain their
+    shared lexical surface.  Negation, digit-bearing IDs, and ambiguous matches
+    remain untouched.
+    """
+    ref_matches = list(_RAW_SPOKEN_TOKEN_RE.finditer(ref_text or ""))
+    hyp_matches = list(_RAW_SPOKEN_TOKEN_RE.finditer(hyp_text or ""))
+    if not ref_matches or not hyp_matches:
+        return [], ref_text, hyp_text
+
+    def clean_span(matches: Sequence[re.Match[str]]) -> str:
+        """Return one lowercase alphanumeric compact surface for a raw span."""
+        return "".join(_clean_context_word(match.group(0)) for match in matches)
+
+    def anchored(ref_start: int, ref_end: int, hyp_start: int, hyp_end: int) -> bool:
+        """Require every available neighbor so repeated prose cannot cross-match."""
+        left_matches = ref_start > 0 and hyp_start > 0 and (
+            _clean_context_word(ref_matches[ref_start - 1].group(0))
+            == _clean_context_word(hyp_matches[hyp_start - 1].group(0))
+        )
+        right_matches = ref_end < len(ref_matches) and hyp_end < len(hyp_matches) and (
+            _clean_context_word(ref_matches[ref_end].group(0))
+            == _clean_context_word(hyp_matches[hyp_end].group(0))
+        )
+        # A single shared neighbor is insufficient in prose with repeated words:
+        # it can pair a structured span with a different occurrence farther in
+        # the sentence and reorder otherwise identical speech.  At a true text
+        # edge one neighbor is all that exists; everywhere else both must hold.
+        has_left = ref_start > 0 and hyp_start > 0
+        has_right = ref_end < len(ref_matches) and hyp_end < len(hyp_matches)
+        return (
+            (not has_left or left_matches)
+            and (not has_right or right_matches)
+            and (left_matches or right_matches)
+        )
+
+    candidates: List[Tuple[int, int, int, int, str, str]] = []
+    for ref_len, hyp_len in ((1, 2), (2, 1), (1, 3), (3, 1)):
+        for ref_start in range(len(ref_matches) - ref_len + 1):
+            ref_end = ref_start + ref_len
+            ref_span = ref_matches[ref_start:ref_end]
+            for hyp_start in range(len(hyp_matches) - hyp_len + 1):
+                hyp_end = hyp_start + hyp_len
+                if not anchored(ref_start, ref_end, hyp_start, hyp_end):
+                    continue
+                hyp_span = hyp_matches[hyp_start:hyp_end]
+                words = [
+                    _clean_context_word(match.group(0))
+                    for match in [*ref_span, *hyp_span]
+                ]
+                raw_surfaces = [match.group(0) for match in [*ref_span, *hyp_span]]
+                if (
+                    not all(words)
+                    or any(word in NEGATIONS for word in words)
+                    or any(_is_id_like_token(surface) for surface in raw_surfaces)
+                ):
+                    continue
+                ref_compact = clean_span(ref_span)
+                hyp_compact = clean_span(hyp_span)
+                exact = ref_compact == hyp_compact
+                ref_structured = (
+                    "'" in ref_text[ref_span[0].start():ref_span[-1].end()]
+                    or "\u2019" in ref_text[ref_span[0].start():ref_span[-1].end()]
+                    or "-" in ref_text[ref_span[0].start():ref_span[-1].end()]
+                )
+                hyp_structured = (
+                    "'" in hyp_text[hyp_span[0].start():hyp_span[-1].end()]
+                    or "\u2019" in hyp_text[hyp_span[0].start():hyp_span[-1].end()]
+                    or "-" in hyp_text[hyp_span[0].start():hyp_span[-1].end()]
+                )
+                has_hyphen = (
+                    "-" in ref_text[ref_span[0].start():ref_span[-1].end()]
+                    or "-" in hyp_text[hyp_span[0].start():hyp_span[-1].end()]
+                )
+                # A clitic must participate in the actual multi-token span;
+                # otherwise ``Hamm's`` could incorrectly consume ``of hams``.
+                ref_internal_apostrophe = any(
+                    re.search(r"[A-Za-z]['\u2019][A-Za-z]", match.group(0))
+                    and not re.search(r"['\u2019]s$", match.group(0), re.IGNORECASE)
+                    for match in ref_span
+                )
+                hyp_internal_apostrophe = any(
+                    re.search(r"[A-Za-z]['\u2019][A-Za-z]", match.group(0))
+                    and not re.search(r"['\u2019]s$", match.group(0), re.IGNORECASE)
+                    for match in hyp_span
+                )
+                apostrophe_bearing_span = any(
+                    "'" in match.group(0) or "\u2019" in match.group(0)
+                    for match in [*ref_span, *hyp_span]
+                )
+                protected_word_beside_apostrophe = any(
+                    word in PERSONAL_PRONOUNS or word == "if" for word in words
+                )
+                structured = (
+                    (ref_len > 1 and ref_structured)
+                    or (hyp_len > 1 and hyp_structured)
+                    or ref_internal_apostrophe
+                    or hyp_internal_apostrophe
+                )
+                phonetic = (
+                    not exact
+                    and structured
+                    # A fuzzy boundary rewrite must not consume a protected
+                    # word beside an apostrophe-bearing contraction.  For example, it
+                    # must not turn ``We aren't`` into ``aren't`` or absorb
+                    # ``her`` into ``t'ward her``. Dedicated contraction and
+                    # possessive rules handle those surfaces without deleting
+                    # adjacent speech.
+                    and not (
+                        apostrophe_bearing_span and protected_word_beside_apostrophe
+                    )
+                    and min(len(ref_compact), len(hyp_compact)) >= 5
+                    and abs(len(ref_compact) - len(hyp_compact)) <= 2
+                    # Numeric values must agree exactly; ``sixpack`` may join
+                    # ``six-pack``, but never a different ``five-pack``.
+                    and not any(
+                        compact.startswith(number_word)
+                        for compact in (ref_compact, hyp_compact)
+                        for number_word in _SPLIT_WORD_DIGIT_WORDS
+                    )
+                    and (
+                        tokens_phonetically_equal(
+                            ref_compact, hyp_compact, phonetic_threshold
+                        )
+                        or spoken_token_equivalent(
+                            ref_compact, hyp_compact, phonetic_threshold
+                        ) == "phonetic"
+                    )
+                )
+                # Ordinary exact boundaries remain visible to the existing DP
+                # evidence path. Raw handling is only needed before numeric
+                # slotting when one side actually uses a hyphen.
+                raw_exact = exact and has_hyphen
+                if not raw_exact and not phonetic:
+                    continue
+                candidates.append((
+                    ref_start, ref_end, hyp_start, hyp_end,
+                    "exact_surface" if raw_exact else "structured_phonetic",
+                    hyp_text[hyp_span[0].start():hyp_span[-1].end()],
+                ))
+
+    # Apply every unambiguous, non-overlapping pair.  There is intentionally no
+    # per-chunk count limit: independently anchored spelling surfaces are not
+    # extra spoken content.
+    replacements: List[Tuple[int, int, str, Dict[str, Any]]] = []
+    used_ref: Set[int] = set()
+    used_hyp: Set[int] = set()
+    for ref_start, ref_end, hyp_start, hyp_end, method, replacement in sorted(
+        candidates,
+        key=lambda item: (
+            item[0],
+            item[4] != "exact_surface",
+            (item[1] - item[0]) + (item[3] - item[2]),
+            item[2],
+        ),
+    ):
+        if any(index in used_ref for index in range(ref_start, ref_end)) or any(
+            index in used_hyp for index in range(hyp_start, hyp_end)
+        ):
+            continue
+        start = ref_matches[ref_start].start()
+        end = ref_matches[ref_end - 1].end()
+        expected = ref_text[start:end]
+        replacements.append((
+            start,
+            end,
+            replacement,
+            {
+                "kind": "raw_compact_boundary_surface",
+                "expected": expected,
+                "hypothesis": replacement,
+                "method": method,
+            },
+        ))
+        used_ref.update(range(ref_start, ref_end))
+        used_hyp.update(range(hyp_start, hyp_end))
+
+    rewritten_ref = ref_text
+    for start, end, replacement, _evidence in reversed(replacements):
+        rewritten_ref = f"{rewritten_ref[:start]}{replacement}{rewritten_ref[end:]}"
+    return (
+        [evidence for _start, _end, _replacement, evidence in replacements],
+        rewritten_ref,
+        hyp_text,
+    )
+
+
 def _raw_apostrophe_s_surface_equivalence(
     ref_text: str,
     hyp_text: str,
-) -> Tuple[Optional[Dict[str, Any]], str, str]:
-    """Rewrite one source apostrophe-s token matched by equal raw neighbors.
+) -> Tuple[List[Dict[str, Any]], str, str]:
+    """Rewrite all anchored apostrophe-s surfaces before contraction expansion.
 
     ASR may write a possessive or contracted ``'s`` without the apostrophe,
     either as the bare base word or with a plural-looking final ``s``.  Exact
@@ -1229,7 +1986,10 @@ def _raw_apostrophe_s_surface_equivalence(
             if hyp_comparison_surface == ref_comparison_surface:
                 continue
             hyp_clean = _clean_context_word(hyp_surface)
-            if hyp_clean not in {base, f"{base}s"}:
+            if (
+                hyp_clean not in {base, f"{base}s"}
+                and not tokens_phonetically_equal(base, hyp_clean)
+            ):
                 continue
             hyp_neighbors = (
                 _clean_context_word(hyp_matches[hyp_index - 1].group(0)),
@@ -1246,24 +2006,35 @@ def _raw_apostrophe_s_surface_equivalence(
                 ref_index,
                 hyp_surface,
             ))
-    if len(candidates) != 1:
-        return None, ref_text, hyp_text
-    evidence, ref_index, replacement = candidates[0]
-    start, end = ref_matches[ref_index].span()
-    return evidence, f"{ref_text[:start]}{replacement}{ref_text[end:]}", hyp_text
+    by_reference: Dict[int, List[Tuple[Dict[str, Any], str]]] = {}
+    for evidence, ref_index, replacement in candidates:
+        by_reference.setdefault(ref_index, []).append((evidence, replacement))
+    replacements: List[Tuple[int, int, str, Dict[str, Any]]] = []
+    for ref_index, matches in by_reference.items():
+        # Repeated surrounding words can make a raw candidate ambiguous; leave
+        # those to token alignment instead of choosing an arbitrary ASR token.
+        if len(matches) != 1:
+            continue
+        evidence, replacement = matches[0]
+        start, end = ref_matches[ref_index].span()
+        replacements.append((start, end, replacement, evidence))
+    rewritten_ref = ref_text
+    for start, end, replacement, _evidence in reversed(replacements):
+        rewritten_ref = f"{rewritten_ref[:start]}{replacement}{rewritten_ref[end:]}"
+    return [evidence for _start, _end, _replacement, evidence in replacements], rewritten_ref, hyp_text
 
 
-def _raw_exact_surface_word_fusion_equivalence(
+def _raw_possessive_or_contraction_surface_fusion_equivalence(
     ref_text: str,
     hyp_text: str,
 ) -> Tuple[Optional[Dict[str, Any]], str, str]:
-    """Accept one exact prose word-boundary fusion before normalization.
+    """Normalize one exact apostrophe-bearing surface fusion before tokenization.
 
-    ASR can emit two or three adjacent spoken words as one token, especially
-    around possessives and contractions.  This accepts only a sole raw-token
-    difference whose letters agree exactly after spaces, apostrophes, and
-    hyphens are removed.  Numeric, identifier-like, and initialism spans stay
-    protected because word boundaries are significant in those forms.
+    Possessives and contractions must remain raw until their intended surface
+    is recovered: expanding ``Tran's face`` to ``tran is face`` would otherwise
+    prevent an exact match with ASR ``Transface``. Generic prose fusion is not
+    rewritten here; it reaches dynamic-programming alignment as explicit
+    boundary evidence instead.
     """
     difference = _raw_token_difference(ref_text, hyp_text)
     if difference is None:
@@ -1278,6 +2049,8 @@ def _raw_exact_surface_word_fusion_equivalence(
     single_span = hyp_span if len(hyp_span) == 1 else ref_span
     split_surfaces = [match.group(0) for match in split_span]
     single_surface = single_span[0].group(0)
+    if not any("'" in surface or "\u2019" in surface for surface in [*split_surfaces, single_surface]):
+        return None, ref_text, hyp_text
     split_words = [_clean_context_word(surface) for surface in split_surfaces]
     single_word = _clean_context_word(single_surface)
     if not single_word or not all(split_words):
@@ -1312,6 +2085,7 @@ def _raw_exact_surface_word_fusion_equivalence(
         return (
             {
                 "kind": "exact_surface_word_fusion",
+                "specialized_rule": "apostrophe_surface",
                 "expected": expected,
                 "hypothesis": hypothesis,
             },
@@ -1322,6 +2096,7 @@ def _raw_exact_surface_word_fusion_equivalence(
     return (
         {
             "kind": "exact_surface_word_split",
+            "specialized_rule": "apostrophe_surface",
             "expected": expected,
             "hypothesis": hypothesis,
         },
@@ -1649,6 +2424,67 @@ def _raw_bare_two_letter_acronym_equivalence(
     )
 
 
+def _raw_consonant_acronym_equivalence(
+    ref_text: str,
+    hyp_text: str,
+) -> Tuple[Optional[Dict[str, Any]], str, str]:
+    """Align a short uppercase ASR acronym with its source word skeleton.
+
+    Some ASR decoders emit an all-caps abbreviation for a spoken name or
+    invented term, such as ``Devi`` → ``DV``. Accept only one isolated raw
+    token difference when the hypothesis is a short uppercase token, its
+    letters exactly equal the reference consonant skeleton, and phonetic
+    evidence also supports the reduction. This keeps the rule structural
+    rather than naming any particular book term.
+
+    Args:
+        ref_text: Source text before normalization.
+        hyp_text: ASR text before normalization.
+
+    Returns:
+        Evidence plus rewritten reference/hypothesis text when safe; otherwise
+        ``(None, ref_text, hyp_text)``.
+    """
+    difference = _raw_token_difference(ref_text, hyp_text)
+    if difference is None:
+        return None, ref_text, hyp_text
+    ref_matches, hyp_matches, prefix, ref_end, hyp_end = difference
+    ref_span = ref_matches[prefix:ref_end]
+    hyp_span = hyp_matches[prefix:hyp_end]
+    if len(ref_span) != 1 or len(hyp_span) != 1:
+        return None, ref_text, hyp_text
+
+    ref_surface = ref_span[0].group(0)
+    hyp_surface = hyp_span[0].group(0)
+    if (
+        not ref_surface.isalpha()
+        or not hyp_surface.isalpha()
+        or not hyp_surface.isupper()
+        or not 2 <= len(hyp_surface) <= 4
+        or len(ref_surface) <= len(hyp_surface)
+    ):
+        return None, ref_text, hyp_text
+    ref_clean = ref_surface.lower()
+    hyp_clean = hyp_surface.lower()
+    consonants = "".join(char for char in ref_clean if char not in "aeiou")
+    if consonants != hyp_clean:
+        return None, ref_text, hyp_text
+    if not tokens_phonetically_equal(ref_clean, hyp_clean):
+        return None, ref_text, hyp_text
+
+    start, end = ref_span[0].span()
+    return (
+        {
+            "kind": "consonant_acronym_surface_variation",
+            "expected": ref_surface,
+            "hypothesis": hyp_surface,
+            "rendered": hyp_clean,
+        },
+        f"{ref_text[:start]}{hyp_surface}{ref_text[end:]}",
+        hyp_text,
+    )
+
+
 def _raw_single_conjunction_omission_equivalence(
     ref_text: str,
     hyp_text: str,
@@ -1786,19 +2622,18 @@ def _raw_split_word_number_equivalence(
     return candidates[0]
 
 
-def _raw_resegmented_phrase_equivalence(
+def _raw_albeit_resegmentation_equivalence(
     ref_text: str,
     hyp_text: str,
     strict_ref_tokens: Optional[Set[str]] = None,
 ) -> Tuple[Optional[Dict[str, Any]], str]:
-    """Return a safe one-to-many raw phrase rewrite for ASR word splitting.
+    """Preserve the guarded ``Albeit`` ↔ ``I'll be at`` raw compatibility rule.
 
-    The source and hypothesis must be identical outside one phrase. The source
-    side is exactly one ordinary word, the ASR side is two or three words, and
-    their joined forms stay within the approved two-character spoken-space
-    bound. This repairs forms such as ``Albeit`` read by ASR as
-    ``I'll be at`` without permitting added prose, identifiers, numbers, or
-    negation changes.
+    This is intentionally not a generic pre-alignment rewrite. Ordinary exact
+    resegmentation must remain visible to dynamic programming as a boundary
+    operation. ``Albeit`` has a genuinely different compact surface after
+    contraction expansion, so its existing narrow compatibility behavior stays
+    separately named and auditable.
     """
     difference = _raw_token_difference(ref_text, hyp_text)
     if difference is None:
@@ -1808,40 +2643,30 @@ def _raw_resegmented_phrase_equivalence(
     hyp_tokens = [match.group(0).lower().replace("\u2019", "'") for match in hyp_matches]
     ref_span = ref_tokens[prefix:ref_end]
     hyp_span = hyp_tokens[prefix:hyp_end]
-    if len(ref_span) != 1 or len(hyp_span) not in {2, 3}:
+    if {len(ref_span), len(hyp_span)} != {1, 3}:
         return None, hyp_text
 
-    ref_word = _clean_context_word(ref_span[0])
+    ref_words = [_clean_context_word(token) for token in ref_span]
     hyp_words = [_clean_context_word(token) for token in hyp_span]
-    hyp_joined = "".join(hyp_words)
-    ref_span_normalized, _ = normalize(ref_matches[prefix].group(0))
-    hyp_span_normalized, _ = normalize(hyp_text[
-        hyp_matches[prefix].start():hyp_matches[hyp_end - 1].end()
-    ])
-    if (
-        not ref_word
-        or not all(hyp_words)
-        or len(ref_word) < 4
-        or len(hyp_joined) < 4
-        or (strict_ref_tokens and ref_word in strict_ref_tokens)
-        or ref_word in NEGATIONS
-        or any(word in NEGATIONS for word in hyp_words)
-        or any(token in NEGATIONS for token in ref_span_normalized.split())
-        or any(token in NEGATIONS for token in hyp_span_normalized.split())
-        or _is_id_like_token(ref_span[0])
-        or any(_is_id_like_token(token) for token in hyp_span)
-        or _looks_numeric_word(ref_word)
-        or any(_looks_numeric_word(word) for word in hyp_words)
-        or abs(len(ref_word) - len(hyp_joined)) > 2
+    if not all([*ref_words, *hyp_words]):
+        return None, hyp_text
+    if strict_ref_tokens and any(token in strict_ref_tokens for token in ref_words):
+        return None, hyp_text
+    if not (
+        (tuple(ref_words), tuple(hyp_words)) == (("albeit",), ("ill", "be", "at"))
+        or (tuple(ref_words), tuple(hyp_words)) == (("ill", "be", "at"), ("albeit",))
     ):
         return None, hyp_text
 
     start = hyp_matches[prefix].start()
     end = hyp_matches[hyp_end - 1].end()
-    rewritten_hyp = f"{hyp_text[:start]}{ref_matches[prefix].group(0)}{hyp_text[end:]}"
+    ref_start = ref_matches[prefix].start()
+    ref_stop = ref_matches[ref_end - 1].end()
+    rewritten_hyp = f"{hyp_text[:start]}{ref_text[ref_start:ref_stop]}{hyp_text[end:]}"
     return {
         "kind": "raw_phrase_resegmentation",
-        "expected": ref_matches[prefix].group(0),
+        "specialized_rule": "albeit",
+        "expected": ref_text[ref_start:ref_stop],
         "hypothesis": hyp_text[start:end],
     }, rewritten_hyp
 
@@ -1956,10 +2781,27 @@ def _roman_to_int_token(token: str) -> Optional[int]:
 
 def _replace_uppercase_roman_numerals(text: str) -> str:
     """Convert explicit uppercase Roman numerals before numeric slot detection."""
+    def has_numeric_context(start: int) -> bool:
+        """Return whether nearby prose explicitly frames a Roman numeral."""
+        before = re.findall(r"[A-Za-z]+", text[:start].lower())
+        after = re.findall(r"[A-Za-z]+", text[start:].lower())
+        nearby = set(before[-2:]) | set(after[:2])
+        return bool(nearby & _ROMAN_CONTEXT_WORDS)
+
     def replace(match: re.Match) -> str:
         """Keep non-Roman candidates intact while converting valid numeral tokens."""
-        value = _roman_to_int_token(match.group(1))
-        return str(value) if value is not None else match.group(1)
+        candidate = match.group(1)
+        # Two-letter additive Roman strings are frequently uppercase acronyms
+        # (for example, ``DV``). Require explicit enumeration context before
+        # converting them; subtractive forms such as ``IV`` remain supported.
+        if (
+            len(candidate) == 2
+            and candidate.lower() not in _ROMAN_SUBTRACTIVE_PAIRS
+            and not has_numeric_context(match.start(1))
+        ):
+            return candidate
+        value = _roman_to_int_token(candidate)
+        return str(value) if value is not None else candidate
 
     return _UPPER_ROMAN_TOKEN_RE.sub(replace, text)
 
@@ -2296,26 +3138,6 @@ def tokens_phonetically_equal(a: str, b: str, threshold: float = 0.85) -> bool:
     return False
 
 
-def _multi_token_name_match(ref: str, joined_hyp: str, threshold: float = 0.85) -> bool:
-    """
-    Match a long reference name against concatenated hypothesis tokens.
-
-    Requires similar length so short words never absorb trailing content.
-    """
-    if len(ref) < 5 or len(joined_hyp) < 4:
-        return False
-    # Length must be within ~40% to absorb trailing "thank you" etc.
-    longer = max(len(ref), len(joined_hyp))
-    shorter = min(len(ref), len(joined_hyp))
-    if shorter / longer < 0.6:
-        return False
-    if tokens_phonetically_equal(ref, joined_hyp, threshold):
-        return True
-    if fuzz.ratio(ref, joined_hyp) >= 72:
-        return True
-    return False
-
-
 def spoken_token_equivalent(
     ref: str,
     hyp: str,
@@ -2325,7 +3147,7 @@ def spoken_token_equivalent(
     """
     Classify token pair equivalence.
 
-    Returns: exact | normalized | phonetic | none.
+    Returns: exact | normalized | homograph | phonetic | none.
 
     ``strict_ref_tokens`` protects one-off short all-caps source acronyms from
     the general same-space tolerance. Recurring acronyms are supplied through
@@ -2366,6 +3188,20 @@ def spoken_token_equivalent(
     if strict_ref_tokens and ref_clean in strict_ref_tokens:
         return "none"
     hyp_clean = _clean_context_word(ha)
+    homograph_pair = _homograph_pair_key((ref_clean,), (hyp_clean,))
+    if (
+        homograph_pair is not None
+        and homograph_pair in _HOMOGRAPH_WHITELIST_PAIRS
+        and not _is_placeholder_token(ref)
+        and not _is_placeholder_token(hyp)
+        and not _is_id_like_token(ref)
+        and not _is_id_like_token(hyp)
+        and not _looks_numeric_word(ref_clean)
+        and not _looks_numeric_word(hyp_clean)
+        and not _contains_negation_text(ra)
+        and not _contains_negation_text(ha)
+    ):
+        return "homograph"
     if (
         frozenset({ref_clean, hyp_clean}) in _SPOKEN_LETTER_HOMOPHONE_PAIRS
         and not _is_id_like_token(ref)
@@ -2447,6 +3283,11 @@ def _aligned_single_token_spelling_equivalent(
     hyp_clean = _clean_context_word(hyp)
     if not ref_clean or not hyp_clean:
         return False
+    # Structural conjunction/range words are not spelling variants. Protect
+    # them here because this late same-space pass otherwise turns ``to`` ↔
+    # ``and`` into a phonetic match after the numeric shapes were separated.
+    if ref_clean != hyp_clean and {ref_clean, hyp_clean} <= {"and", "or", "to"}:
+        return False
     if (
         _is_placeholder_token(ref)
         or _is_placeholder_token(hyp)
@@ -2482,43 +3323,149 @@ def _aligned_single_token_spelling_equivalent(
     return True
 
 
-def _local_joined_span_equivalent(
+_SPECIAL_EXACT_BOUNDARY_RESEGMENTATIONS = frozenset({
+    (("a", "round"), ("around",)),
+    (("in", "to"), ("into",)),
+})
+_GUARDED_PHONETIC_BOUNDARY_PREFIXES = frozenset({
+    "a", "an", "the", "my", "your", "his", "her", "our", "their", "for",
+})
+_GUARDED_TITLE_NAME_PREFIXES = frozenset({
+    "captain", "commander", "doctor", "dr", "herr", "madam", "miss", "mister",
+    "monsieur", "mr", "mrs", "ms", "professor", "sir",
+})
+
+
+def _special_exact_boundary_resegmentation_mode(
+    ref_words: Sequence[str],
+    hyp_words: Sequence[str],
+) -> Optional[str]:
+    """Return explicit compatibility evidence for retained exact boundary forms."""
+    pair = (tuple(ref_words), tuple(hyp_words))
+    reverse_pair = (pair[1], pair[0])
+    if pair in _SPECIAL_EXACT_BOUNDARY_RESEGMENTATIONS or reverse_pair in _SPECIAL_EXACT_BOUNDARY_RESEGMENTATIONS:
+        return "special_exact_surface"
+    return None
+
+
+def _guarded_function_boundary_phonetic_mode(
+    ref_words: Sequence[str],
+    hyp_words: Sequence[str],
+    phonetic_threshold: float = 0.85,
+) -> Optional[str]:
+    """Retain narrow name-like function-prefix splits without generic fuzzy joins.
+
+    This preserves legacy cases such as ``Maiwand`` ↔ ``my wand`` and
+    ``for Carthum`` ↔ ``Forcatham``. Both spans must contain the same bounded
+    one-to-two shape, the split form must begin with a named function prefix,
+    and the joined forms must satisfy the existing strict phonetic comparator.
+    Negation never enters this fuzzy rule; exact compact resegmentation handles
+    preserved negation content separately.
+    """
+    if {len(ref_words), len(hyp_words)} != {1, 2}:
+        return None
+    if any(word in NEGATIONS for word in [*ref_words, *hyp_words]):
+        return None
+    split_words = ref_words if len(ref_words) == 2 else hyp_words
+    single_word = hyp_words[0] if len(hyp_words) == 1 else ref_words[0]
+    if (
+        split_words[0] not in _GUARDED_PHONETIC_BOUNDARY_PREFIXES
+        or not _is_content_word(split_words[1])
+        or len(single_word) < 4
+        or len(split_words[1]) < 2
+    ):
+        return None
+    joined_split = "".join(split_words)
+    if tokens_phonetically_equal(single_word, joined_split, phonetic_threshold):
+        return "guarded_function_phonetic"
+    return None
+
+
+def _guarded_title_name_phonetic_mode(
+    ref_words: Sequence[str],
+    hyp_words: Sequence[str],
+    strict_ref_tokens: Optional[Set[str]] = None,
+    phonetic_threshold: float = 0.85,
+) -> Optional[str]:
+    """Retain title-plus-name fusion without reopening generic content fuzziness.
+
+    A title, such as ``Herr``, followed by a name is a recognizable spoken
+    structure. Its fused ASR rendering is allowed only when the joined form
+    passes strict phonetic comparison. Ordinary content pairs stay excluded so
+    ``Black goop`` cannot be accepted as ``Blackcoop``.
+    """
+    if {len(ref_words), len(hyp_words)} != {1, 2}:
+        return None
+    if any(word in NEGATIONS for word in [*ref_words, *hyp_words]):
+        return None
+    split_words = ref_words if len(ref_words) == 2 else hyp_words
+    single_word = hyp_words[0] if len(hyp_words) == 1 else ref_words[0]
+    if (
+        split_words[0] not in _GUARDED_TITLE_NAME_PREFIXES
+        or not _is_content_word(split_words[1])
+        or len(split_words[1]) < 3
+        or len(single_word) < 5
+        or (strict_ref_tokens and any(word in strict_ref_tokens for word in ref_words))
+    ):
+        return None
+    if tokens_phonetically_equal(single_word, "".join(split_words), phonetic_threshold):
+        return "guarded_title_phonetic"
+    return None
+
+
+def _guarded_reduced_auxiliary_you_mode(
+    ref_words: Sequence[str],
+    hyp_words: Sequence[str],
+) -> Optional[str]:
+    """Match reduced ``d'you`` speech with ASR's expanded ``do you`` form.
+
+    This is a contraction-pronunciation rule, not generic fuzzy word fusion.
+    It remains bounded to the normalized ``dyou`` surface and the exact
+    auxiliary-plus-pronoun expansion so unrelated content words cannot enter.
+    """
+    if (tuple(ref_words), tuple(hyp_words)) in {
+        (("dyou",), ("do", "you")),
+        (("do", "you"), ("dyou",)),
+    }:
+        return "guarded_reduced_auxiliary"
+    return None
+
+
+def _boundary_resegmentation_mode(
     ref_span: Sequence[str],
     hyp_span: Sequence[str],
     strict_ref_tokens: Optional[Set[str]] = None,
-) -> bool:
-    """Accept one-to-two or two-to-one ASR resegmentation with equal space.
+) -> Optional[str]:
+    """Return match mode for a bounded prose word-boundary resegmentation.
 
-    The rule joins each bounded span and accepts only ordinary prose whose
-    joined spellings differ by at most two characters. A source negation never
-    enters this rule. A hypothesis ``no`` may participate only as part of a
-    two-word rendering of one non-negated source word, such as ``nowhere`` to
-    ``no way``.
+    Word boundaries are not spoken content, so one token may match two or three
+    adjacent tokens when their compact letter surfaces are identical. This is
+    transcript-equivalence policy, not a claim that the alternatives share
+    spelling or semantic intent. Generic fuzzy resegmentation is prohibited;
+    only a separately guarded legacy function-prefix phonetic rule remains.
+    Protected numeric, identifier, and acronym material stays on specialized
+    comparison paths.
+
+    Args:
+        ref_span: Consecutive normalized reference tokens.
+        hyp_span: Consecutive normalized hypothesis tokens.
+        strict_ref_tokens: Source acronym tokens that must not be resegmented.
+
+    Returns:
+        Exact or named guarded match evidence, otherwise ``None``.
     """
     if len(ref_span) == len(hyp_span) or not ref_span or not hyp_span:
-        return False
+        return None
+    if {len(ref_span), len(hyp_span)} not in ({1, 2}, {1, 3}):
+        return None
+
     ref_words = [_clean_context_word(token) for token in ref_span]
     hyp_words = [_clean_context_word(token) for token in hyp_span]
     if not all(ref_words) or not all(hyp_words):
-        return False
+        return None
     if strict_ref_tokens and any(token in strict_ref_tokens for token in ref_words):
-        return False
-    article_compound = (
-        len(ref_words) == 2
-        and len(hyp_words) == 1
-        and ref_words[0] == "a"
-        and hyp_words[0] == f"a{ref_words[1]}"
-    )
-    # Exact joins such as ``in to`` ↔ ``into`` may use function words; other
-    # multi-token function spans stay rejected so soft prepositions cannot hide.
-    exact_function_join = "".join(ref_words) == "".join(hyp_words)
-    if (
-        len(ref_words) > 1
-        and not all(_is_content_word(token) for token in ref_words)
-        and not article_compound
-        and not exact_function_join
-    ):
-        return False
+        return None
+
     protected_tokens = [*ref_span, *hyp_span]
     if any(
         _is_placeholder_token(token)
@@ -2526,25 +3473,36 @@ def _local_joined_span_equivalent(
         or _looks_numeric_word(_clean_context_word(token))
         for token in protected_tokens
     ):
-        return False
-    if any(token in NEGATIONS for token in ref_words):
-        return False
-    if any(token in NEGATIONS for token in hyp_words):
-        if not (len(ref_words) == 1 and len(hyp_words) == 2):
-            return False
+        return None
+
     ref_joined = "".join(ref_words)
     hyp_joined = "".join(hyp_words)
-    if len(hyp_words) > 1 and hyp_words[0] in FUNCTION_WORDS and hyp_words[0] != "no":
-        # A source word may be split into a real phrase (Maiwand → my wand).
-        # Permit that only when their joined sounds agree, never by length alone.
-        return (
-            len(ref_words) == 1
-            and len(ref_joined) >= 4
-            and tokens_phonetically_equal(ref_joined, hyp_joined)
-        )
-    return min(len(ref_joined), len(hyp_joined)) >= 3 and abs(
-        len(ref_joined) - len(hyp_joined)
-    ) <= 2
+    homograph_pair = _homograph_pair_key(ref_words, hyp_words)
+    if (
+        homograph_pair is not None
+        and homograph_pair in _HOMOGRAPH_WHITELIST_PAIRS
+        and not any(word in NEGATIONS for word in [*ref_words, *hyp_words])
+    ):
+        return "homograph_whitelist"
+    if ref_joined == hyp_joined:
+        return _special_exact_boundary_resegmentation_mode(ref_words, hyp_words) or "exact_surface"
+    reduced_auxiliary_mode = _guarded_reduced_auxiliary_you_mode(ref_words, hyp_words)
+    if reduced_auxiliary_mode is not None:
+        return reduced_auxiliary_mode
+    return _guarded_function_boundary_phonetic_mode(ref_words, hyp_words)
+
+
+def _local_joined_span_equivalent(
+    ref_span: Sequence[str],
+    hyp_span: Sequence[str],
+    strict_ref_tokens: Optional[Set[str]] = None,
+) -> bool:
+    """Return whether local prose spans differ only by word boundaries."""
+    return _boundary_resegmentation_mode(
+        ref_span,
+        hyp_span,
+        strict_ref_tokens=strict_ref_tokens,
+    ) is not None
 
 
 def _expected_repeat_collapse_equivalent(
@@ -2690,6 +3648,7 @@ def _accept_local_same_space_substitutions(
         "normalized_equivalent",
         "phonetic_equivalent",
         "ambiguous_equivalent",
+        "boundary_resegmentation",
         "identifier_wildcard",
     }
     ref_count = int(alignment.get("reference_token_count") or 0)
@@ -2701,7 +3660,12 @@ def _accept_local_same_space_substitutions(
     )
     score_sum = 0.0
     for operation in updated_operations:
-        if operation["op"] in {"exact_match", "normalized_equivalent", "phonetic_equivalent"}:
+        if operation["op"] in {
+            "exact_match",
+            "normalized_equivalent",
+            "phonetic_equivalent",
+            "boundary_resegmentation",
+        }:
             score_sum += len(str(operation.get("ref") or "").split())
         elif operation["op"] in {"ambiguous_equivalent", "identifier_wildcard"}:
             score_sum += 1.0
@@ -2862,6 +3826,10 @@ def normalize(
     text = _ACRONYM_POSSESSIVE_RE.sub(lambda match: match.group(1), text)
     text = _APOSTROPHE_RE.sub("'", text)
     text = separate_attached_measure_units(text)
+    # Numeric-led adjective compounds are number + prose (``16-year-old``),
+    # not opaque mixed IDs. Split their numeric/prose boundary before the ID
+    # pass; internal number hyphens such as ``twenty-one`` remain intact.
+    text = separate_numeric_compound_surfaces(text)
     # Typed craft IDs (M8-Tron, M. H. Tron) before letter-initialism join so
     # punctuated craft forms are not flattened into bare acronyms.
     text, id_contexts = _replace_typed_identifier_spans(text)
@@ -2989,30 +3957,6 @@ def _identifier_wildcard_span_lengths(
         if prefix_is_identifier_piece and final_is_content:
             lengths.append(len(span))
     return lengths
-
-
-def _letter_join_equivalent(
-    left_tokens: Sequence[str],
-    right_tokens: Sequence[str],
-) -> bool:
-    """Return True when joined alnum letters of two spans are near-identical.
-
-    Covers ASR fusing ``for Carthum`` → ``Forcatham`` or splitting ``Thulla``
-    → ``the la`` without requiring dictionary names.
-    """
-    def join_letters(tokens: Sequence[str]) -> str:
-        """Joins a sequence of strings into one after cleaning each."""
-        return "".join(_clean_context_word(token) for token in tokens)
-
-    left = join_letters(left_tokens)
-    right = join_letters(right_tokens)
-    if not left or not right:
-        return False
-    if left == right:
-        return True
-    if abs(len(left) - len(right)) > max(2, len(left) // 5):
-        return False
-    return fuzz.ratio(left, right) >= 82
 
 
 def _copula_homophone_span_match(
@@ -3319,17 +4263,46 @@ def align_tokens(
     raw hypothesis possessive only when that possessive expanded to two tokens.
     """
     n, m = len(ref_tokens), len(hyp_tokens)
-    # dp cost; match=0, sub=1, ins/del=1
+    # Rank every path by hard edits, fuzzy use, operation count, consumed span,
+    # then stable candidate order. Equal edit-distance paths otherwise depend on
+    # append order and can hide an exact boundary behind an older fuzzy join.
+    Rank = Tuple[int, int, int, int, Tuple[int, ...]]
     INF = 10**9
-    dp = [[INF] * (m + 1) for _ in range(n + 1)]
+    inf_rank: Rank = (INF, INF, INF, INF, (INF,))
+    dp: List[List[Rank]] = [[inf_rank] * (m + 1) for _ in range(n + 1)]
     bt: List[List[Optional[str]]] = [[None] * (m + 1) for _ in range(n + 1)]
-    dp[0][0] = 0
+    dp[0][0] = (0, 0, 0, 0, ())
     for i in range(1, n + 1):
-        dp[i][0] = i
+        dp[i][0] = (i, 0, i, -i, (95,) * i)
         bt[i][0] = "del"
     for j in range(1, m + 1):
-        dp[0][j] = j
+        dp[0][j] = (j, 0, j, -j, (96,) * j)
         bt[0][j] = "ins"
+
+    def ranked_candidate(
+        previous_i: int,
+        previous_j: int,
+        kind: str,
+        equivalence: str,
+        hard_edits: int,
+        stable_order: int,
+    ) -> Tuple[Rank, str, str]:
+        """Build one deterministic DP candidate from its predecessor state."""
+        previous = dp[previous_i][previous_j]
+        ref_span = i - previous_i
+        hyp_span = j - previous_j
+        fuzzy = int(equivalence in {
+            "phonetic", "ambiguous", "guarded_function_phonetic", "guarded_title_phonetic",
+            "guarded_reduced_auxiliary",
+        })
+        rank: Rank = (
+            previous[0] + hard_edits,
+            previous[1] + fuzzy,
+            previous[2] + 1,
+            previous[3] - max(ref_span, hyp_span),
+            previous[4] + (stable_order,),
+        )
+        return rank, kind, equivalence
 
     for i in range(1, n + 1):
         for j in range(1, m + 1):
@@ -3341,66 +4314,66 @@ def align_tokens(
                 strict_ref_tokens=strict_ref_tokens,
             )
             match_cost = 0 if eq != "none" else 1
+            direct_order = {
+                "exact": 10,
+                "normalized": 11,
+                "homograph": 20,
+                "phonetic": 30,
+                "ambiguous": 31,
+            }.get(eq, 90)
             candidates = [
-                (dp[i - 1][j - 1] + match_cost, "match" if eq != "none" else "sub", eq),
-                (dp[i - 1][j] + 1, "del", "none"),
-                (dp[i][j - 1] + 1, "ins", "none"),
+                ranked_candidate(i - 1, j - 1, "match" if eq != "none" else "sub", eq, match_cost, direct_order),
+                ranked_candidate(i - 1, j, "del", "none", 1, 95),
+                ranked_candidate(i, j - 1, "ins", "none", 1, 96),
             ]
             ref_tok = ref_tokens[i - 1]
             if _is_placeholder_token(ref_tok):
                 for span_len in _identifier_wildcard_span_lengths(hyp_tokens, j):
-                    candidates.append(
-                        (dp[i - 1][j - span_len], f"wildcard{span_len}", "wildcard")
-                    )
+                    candidates.append(ranked_candidate(
+                        i - 1, j - span_len, f"wildcard{span_len}", "wildcard", 0, 20
+                    ))
             # Copula homophones: they are ↔ their, we are ↔ were, …
             if i >= 2 and j >= 1 and _copula_homophone_span_match(
                 ref_tokens[i - 2:i],
                 [hyp_tokens[j - 1]],
             ):
-                candidates.append((dp[i - 2][j - 1], "copula_ref2", "phonetic"))
+                candidates.append(ranked_candidate(i - 2, j - 1, "copula_ref2", "phonetic", 0, 40))
             if i >= 1 and j >= 2 and _copula_homophone_span_match(
                 [ref_tok],
                 hyp_tokens[j - 2:j],
             ):
-                candidates.append((dp[i - 1][j - 2], "copula_hyp2", "phonetic"))
-            # Letter-join fusion: for Carthum ↔ Forcatham, Thulla ↔ the la.
-            # Never fuse across negation (not able ↛ notable).
-            if (
-                i >= 2
-                and j >= 1
-                and not _contains_negation_token(ref_tokens[i - 2:i])
-                and not _contains_negation_token([hyp_tokens[j - 1]])
-                and _letter_join_equivalent(ref_tokens[i - 2:i], [hyp_tokens[j - 1]])
-            ):
-                candidates.append((dp[i - 2][j - 1], "letters_ref2", "phonetic"))
-            if (
-                i >= 1
-                and j >= 2
-                and not _contains_negation_token([ref_tok])
-                and not _contains_negation_token(hyp_tokens[j - 2:j])
-                and _letter_join_equivalent([ref_tok], hyp_tokens[j - 2:j])
-            ):
-                candidates.append((dp[i - 1][j - 2], "letters_hyp2", "phonetic"))
-            # Multi-token hyp packs one long name only when joined length is similar
-            if (
-                j >= 2
-                and not (strict_ref_tokens and _clean_context_word(ref_tok) in strict_ref_tokens)
-                and len(ref_tok) >= 5
-                and _is_content_word(ref_tok)
-                and all(_is_content_word(token) for token in hyp_tokens[j - 2:j])
-                and not _is_placeholder_token(ref_tok)
-                and not any(_is_placeholder_token(tok) for tok in hyp_tokens[j - 2:j])
-                and not _contains_negation_token([ref_tok, *hyp_tokens[j - 2:j]])
-            ):
-                joined = hyp_tokens[j - 2] + hyp_tokens[j - 1]
-                if _multi_token_name_match(ref_tok, joined, phonetic_threshold):
-                    candidates.append((dp[i - 1][j - 2], "match2", "phonetic"))
-            if j >= 2 and _local_joined_span_equivalent(
-                [ref_tok],
-                hyp_tokens[j - 2:j],
-                strict_ref_tokens=strict_ref_tokens,
-            ):
-                candidates.append((dp[i - 1][j - 2], "local_hyp2", "phonetic"))
+                candidates.append(ranked_candidate(i - 1, j - 2, "copula_hyp2", "phonetic", 0, 40))
+            if i >= 2 and j >= 1:
+                title_mode = _guarded_title_name_phonetic_mode(
+                    ref_tokens[i - 2:i],
+                    [hyp_tokens[j - 1]],
+                    strict_ref_tokens=strict_ref_tokens,
+                    phonetic_threshold=phonetic_threshold,
+                )
+                if title_mode is not None:
+                    candidates.append(ranked_candidate(i - 2, j - 1, "title_name_ref2", title_mode, 0, 43))
+            if i >= 1 and j >= 2:
+                title_mode = _guarded_title_name_phonetic_mode(
+                    [ref_tok],
+                    hyp_tokens[j - 2:j],
+                    strict_ref_tokens=strict_ref_tokens,
+                    phonetic_threshold=phonetic_threshold,
+                )
+                if title_mode is not None:
+                    candidates.append(ranked_candidate(i - 1, j - 2, "title_name_hyp2", title_mode, 0, 43))
+            for span_len in (2, 3):
+                if j < span_len:
+                    continue
+                boundary_mode = _boundary_resegmentation_mode(
+                    [ref_tok],
+                    hyp_tokens[j - span_len:j],
+                    strict_ref_tokens=strict_ref_tokens,
+                )
+                if boundary_mode is not None:
+                    boundary_order = 12 if boundary_mode in {"exact_surface", "special_exact_surface"} else 41
+                    candidates.append(ranked_candidate(
+                        i - 1, j - span_len, f"boundary_hyp{span_len}", boundary_mode, 0, boundary_order
+                    ))
             if (
                 j >= 2
                 and book_term_tokens
@@ -3418,55 +4391,38 @@ def align_tokens(
                 )
             ):
                 # Only raw apostrophe-s evidence may consume the added ``is``.
-                candidates.append((dp[i - 1][j - 2], "book_possessive_hyp2", "phonetic"))
-            if (
-                j >= 3
-                and not (strict_ref_tokens and _clean_context_word(ref_tok) in strict_ref_tokens)
-                and len(ref_tok) >= 6
-                and _is_content_word(ref_tok)
-                and all(_is_content_word(token) for token in hyp_tokens[j - 3:j])
-                and not _is_placeholder_token(ref_tok)
-                and not any(_is_placeholder_token(tok) for tok in hyp_tokens[j - 3:j])
-                and not _contains_negation_token([ref_tok, *hyp_tokens[j - 3:j]])
-            ):
-                joined3 = "".join(hyp_tokens[j - 3:j])
-                if _multi_token_name_match(ref_tok, joined3, phonetic_threshold):
-                    candidates.append((dp[i - 1][j - 3], "match3", "phonetic"))
+                candidates.append(ranked_candidate(i - 1, j - 2, "book_possessive_hyp2", "phonetic", 0, 42))
             # One hypothesis token can join two reference words without loss.
-            if i >= 2:
-                parts = ref_tokens[i - 2:i]
-                if _local_joined_span_equivalent(
-                    parts,
+            for span_len in (2, 3):
+                if i < span_len:
+                    continue
+                boundary_mode = _boundary_resegmentation_mode(
+                    ref_tokens[i - span_len:i],
                     [hyp_tokens[j - 1]],
                     strict_ref_tokens=strict_ref_tokens,
-                ):
-                    candidates.append((dp[i - 2][j - 1], "local_ref2", "phonetic"))
+                )
+                if boundary_mode is not None:
+                    boundary_order = 12 if boundary_mode in {"exact_surface", "special_exact_surface"} else 41
+                    candidates.append(ranked_candidate(
+                        i - span_len, j - 1, f"boundary_ref{span_len}", boundary_mode, 0, boundary_order
+                    ))
+
+            if i >= 2:
+                parts = ref_tokens[i - 2:i]
                 if _expected_repeat_collapse_equivalent(
                     parts,
                     hyp_tokens[j - 1],
                     strict_ref_tokens=strict_ref_tokens,
                 ):
-                    candidates.append((dp[i - 2][j - 1], "repeat_ref2", "phonetic"))
+                    candidates.append(ranked_candidate(i - 2, j - 1, "repeat_ref2", "phonetic", 0, 50))
                 if _modal_base_to_past_equivalent(parts, hyp_tokens[j - 1]):
-                    candidates.append((dp[i - 2][j - 1], "modal_past_ref2", "phonetic"))
+                    candidates.append(ranked_candidate(i - 2, j - 1, "modal_past_ref2", "phonetic", 0, 51))
                 if _trailing_name_fusion_equivalent(
                     parts,
                     hyp_tokens[j - 1],
                     strict_ref_tokens=strict_ref_tokens,
                 ):
-                    candidates.append((dp[i - 2][j - 1], "name_ref2", "phonetic"))
-                if (
-                    not _contains_negation_token(parts)
-                    and not any(_is_placeholder_token(tok) for tok in parts)
-                    and all(len(_clean_context_word(token)) >= 2 for token in parts)
-                    and all(_is_content_word(token) for token in parts)
-                ):
-                    joined_ref = "".join(parts)
-                    if (
-                        not _is_placeholder_token(hyp_tokens[j - 1])
-                        and spoken_token_equivalent(joined_ref, hyp_tokens[j - 1], phonetic_threshold) != "none"
-                    ):
-                        candidates.append((dp[i - 2][j - 1], "match_ref2", "phonetic"))
+                    candidates.append(ranked_candidate(i - 2, j - 1, "name_ref2", "phonetic", 0, 52))
 
             best = min(candidates, key=lambda x: x[0])
             dp[i][j] = best[0]
@@ -3490,56 +4446,51 @@ def align_tokens(
             op_name = {
                 "exact": "exact_match",
                 "normalized": "normalized_equivalent",
+                "homograph": "phonetic_equivalent",
                 "phonetic": "phonetic_equivalent",
                 "ambiguous": "ambiguous_equivalent",
             }.get(eq, "exact_match")
-            operations.append({
+            operation = {
                 "op": op_name,
                 "ref": ref_tokens[i - 1],
                 "hyp": hyp_tokens[j - 1],
-            })
+            }
+            if eq == "homograph":
+                operation["specialized_rule"] = "homograph_whitelist"
+            operations.append(operation)
             i -= 1
             j -= 1
-        elif kind == "match2":
+        elif kind.startswith("boundary_hyp"):
+            span_len = int(kind.removeprefix("boundary_hyp"))
             operations.append({
-                "op": "phonetic_equivalent",
+                "op": "boundary_resegmentation",
                 "ref": ref_tokens[i - 1],
-                "hyp": " ".join(hyp_tokens[j - 2:j]),
+                "hyp": " ".join(hyp_tokens[j - span_len:j]),
+                "boundary_method": eq,
+                "direction": f"ref_1_to_hyp_{span_len}",
             })
             i -= 1
-            j -= 2
-        elif kind == "match3":
+            j -= span_len
+        elif kind.startswith("boundary_ref"):
+            span_len = int(kind.removeprefix("boundary_ref"))
             operations.append({
-                "op": "phonetic_equivalent",
-                "ref": ref_tokens[i - 1],
-                "hyp": " ".join(hyp_tokens[j - 3:j]),
-            })
-            i -= 1
-            j -= 3
-        elif kind in {"local_hyp2", "book_possessive_hyp2", "copula_hyp2", "letters_hyp2"}:
-            operations.append({
-                "op": "phonetic_equivalent",
-                "ref": ref_tokens[i - 1],
-                "hyp": " ".join(hyp_tokens[j - 2:j]),
-            })
-            i -= 1
-            j -= 2
-        elif kind in {
-            "local_ref2",
-            "repeat_ref2",
-            "name_ref2",
-            "modal_past_ref2",
-            "copula_ref2",
-            "letters_ref2",
-        }:
-            operations.append({
-                "op": "phonetic_equivalent",
-                "ref": " ".join(ref_tokens[i - 2:i]),
+                "op": "boundary_resegmentation",
+                "ref": " ".join(ref_tokens[i - span_len:i]),
                 "hyp": hyp_tokens[j - 1],
+                "boundary_method": eq,
+                "direction": f"ref_{span_len}_to_hyp_1",
             })
-            i -= 2
+            i -= span_len
             j -= 1
-        elif kind == "match_ref2":
+        elif kind in {"book_possessive_hyp2", "copula_hyp2", "title_name_hyp2"}:
+            operations.append({
+                "op": "phonetic_equivalent",
+                "ref": ref_tokens[i - 1],
+                "hyp": " ".join(hyp_tokens[j - 2:j]),
+            })
+            i -= 1
+            j -= 2
+        elif kind in {"repeat_ref2", "name_ref2", "modal_past_ref2", "copula_ref2", "title_name_ref2"}:
             operations.append({
                 "op": "phonetic_equivalent",
                 "ref": " ".join(ref_tokens[i - 2:i]),
@@ -3582,6 +4533,7 @@ def align_tokens(
             "normalized_equivalent",
             "phonetic_equivalent",
             "ambiguous_equivalent",
+            "boundary_resegmentation",
             "identifier_wildcard",
         }
     )
@@ -3593,6 +4545,7 @@ def align_tokens(
             "normalized_equivalent",
             "phonetic_equivalent",
             "ambiguous_equivalent",
+            "boundary_resegmentation",
             "identifier_wildcard",
         }:
             covered_refs += len(str(op.get("ref", "")).split())
@@ -3627,6 +4580,9 @@ def align_tokens(
                 score_sum += 1.0
             elif op["op"] == "phonetic_equivalent":
                 # Accepted sound-alikes and content-preserving joins are neutral.
+                score_sum += len(str(op.get("ref") or "").split())
+            elif op["op"] == "boundary_resegmentation":
+                # Boundary changes preserve all reference spoken content.
                 score_sum += len(str(op.get("ref") or "").split())
             elif op["op"] == "ambiguous_equivalent":
                 score_sum += 1.0
@@ -3801,17 +4757,40 @@ def detect_repetition(
     }
 
 
-def detect_truncation(ref_tokens: Sequence[str], hyp_tokens: Sequence[str]) -> dict:
-    """Detect severe truncation via word-count ratio (<40% of reference words)."""
+def detect_truncation(
+    ref_tokens: Sequence[str],
+    hyp_tokens: Sequence[str],
+    alignment: Optional[Dict[str, Any]] = None,
+) -> dict:
+    """Detect severe truncation after restoring exact boundary-equivalent words.
+
+    Raw ASR token counts understate speech when one token represents two or
+    three exact reference tokens. Count only the known deficit consumed by an
+    accepted boundary operation, leaving unrelated missing content visible.
+    """
     ref_words = len(ref_tokens)
     hyp_words = len(hyp_tokens)
+    effective_hyp_words = hyp_words
+    for operation in (alignment or {}).get("operations", []):
+        if operation.get("op") != "boundary_resegmentation":
+            continue
+        ref_count = len(str(operation.get("ref") or "").split())
+        hyp_count = len(str(operation.get("hyp") or "").split())
+        effective_hyp_words += max(0, ref_count - hyp_count)
     if ref_words == 0:
-        return {"is_truncated": False, "ref_words": 0, "hyp_words": hyp_words, "ratio": 1.0}
-    ratio = hyp_words / ref_words
+        return {
+            "is_truncated": False,
+            "ref_words": 0,
+            "hyp_words": hyp_words,
+            "effective_hyp_words": effective_hyp_words,
+            "ratio": 1.0,
+        }
+    ratio = effective_hyp_words / ref_words
     return {
         "is_truncated": ratio < 0.4,
         "ref_words": ref_words,
         "hyp_words": hyp_words,
+        "effective_hyp_words": effective_hyp_words,
         "ratio": ratio,
     }
 
@@ -3891,6 +4870,10 @@ def _critical_mismatches(
     for sub in alignment.get("substitutions", []):
         ref = (sub.get("ref") or "").lower()
         hyp = (sub.get("hyp") or "").lower()
+        if ref != hyp and {ref, hyp} <= {"and", "or", "to"}:
+            # These words carry list/range structure after numeric slotting;
+            # phonetic leniency must not erase a changed numeric relationship.
+            critical.append({"type": "numeric_structure", "ref": ref, "hyp": hyp})
         if ref == "uhoh" or hyp == "uhoh":
             if ref != hyp and spoken_token_equivalent(ref, hyp, phonetic_threshold) == "none":
                 critical.append({"type": "interjection", "ref": ref, "hyp": hyp})
@@ -4086,8 +5069,6 @@ def _render_aligned_hypothesis(
             rendered.append(str(operation.get("ref") or ""))
         elif op_name == "deletion":
             continue
-        elif op_name in {"match2", "match3", "match_ref2"}:
-            rendered.extend(str(operation.get("hyp") or "").split())
         elif operation.get("hyp") is not None:
             rendered.extend(str(operation.get("hyp") or "").split())
     return " ".join(token for token in rendered if token)
@@ -4098,10 +5079,8 @@ _ALIGNED_MATCH_OPS = frozenset({
     "normalized_equivalent",
     "phonetic_equivalent",
     "ambiguous_equivalent",
+    "boundary_resegmentation",
     "identifier_wildcard",
-    "match2",
-    "match3",
-    "match_ref2",
 })
 
 
@@ -4342,13 +5321,29 @@ def _leading_protected_word_confirmation(
     ref_text: str,
     hyp_text: str,
     canon_lookup: Optional[dict] = None,
+    alignment: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Flag first-position mismatches on protected leading words.
 
     The flag supports two-stage review for short protected starters, especially
     negation words. It never changes PASS/FAIL; it only marks cases that should
-    be handed to Stage 2 for confirmation.
+    be handed to Stage 2 for confirmation. A boundary-aware first alignment
+    operation supersedes the raw first-token check because it may preserve all
+    protected letters across a compound split or fusion.
+
+    Args:
+        ref_text: Original reference text.
+        hyp_text: ASR transcript text.
+        canon_lookup: Optional compatibility canonicalization lookup.
+        alignment: Final token alignment, when available.
     """
+    if alignment:
+        operations = alignment.get("operations") or []
+        if operations and operations[0].get("op") == "boundary_resegmentation":
+            return {
+                "requires_second_stage_confirmation": False,
+                "second_stage_confirmation_reason": "",
+            }
     ref_norm, _ = normalize(ref_text, canon_lookup)
     hyp_norm, _ = normalize(hyp_text, canon_lookup)
     ref_first = next((token for token in ref_norm.split() if token), "")
@@ -4445,22 +5440,87 @@ def compare_spoken(
     Returns structured scores, binary classification (PASS/FAIL), and details.
     """
     ref_text = strip_chatterbox_pause_tags(ref_text)
+    terminal_diagnostic_equivalences: List[Dict[str, Any]] = []
+    diagnostic_match = _ASR_TERMINAL_DIAGNOSTIC_RE.search(hyp_text or "")
+    if diagnostic_match:
+        # A terminal backend annotation is not spoken content when all prior
+        # transcript words still undergo ordinary comparison.
+        terminal_diagnostic_equivalences.append({
+            "kind": "terminal_asr_diagnostic",
+            "expected": "",
+            "hypothesis": diagnostic_match.group(0).strip(),
+        })
+        hyp_text = (hyp_text or "")[:diagnostic_match.start()].rstrip()
     cfg = merge_validation_config(config)
     if threshold is not None:
         cfg["pass_threshold"] = threshold
 
-    possessive_filler_equivalence, ref_possessive_filler_text, hyp_possessive_filler_text = (
-        _raw_lexical_possessive_filler_equivalence(ref_text, hyp_text)
+    phonetic_thr = float(cfg.get("phonetic_match_threshold", 0.85))
+    pre_raw_equivalence = _raw_formatting_equivalence(ref_text, hyp_text)
+    if pre_raw_equivalence is None:
+        pre_raw_equivalence = _raw_normalized_equivalence(
+            ref_text,
+            hyp_text,
+            canon_lookup,
+        )
+    if pre_raw_equivalence is None:
+        pre_raw_equivalence = _raw_reduced_pronoun_equivalence(ref_text, hyp_text)
+    if pre_raw_equivalence is None:
+        pre_raw_equivalence = _raw_call_sign_article_equivalence(ref_text, hyp_text)
+    full_raw_equivalence = pre_raw_equivalence is not None
+    if full_raw_equivalence:
+        # Later raw repair rules are unnecessary once the full utterance has a
+        # proven safe equivalence, and can otherwise cross-match repetitions.
+        hyp_text = ref_text
+    slash_name_equivalence, ref_slash_name_text = _raw_slash_name_equivalence(
+        ref_text,
+        hyp_text,
+        canon_lookup,
     )
-    apostrophe_s_equivalence, ref_apostrophe_s_text, hyp_apostrophe_s_text = (
+    if slash_name_equivalence is not None:
+        # The helper proved whole-utterance normalized equality.
+        ref_text = ref_slash_name_text
+        hyp_text = ref_slash_name_text
+    spoken_code_equivalence, ref_code_text = _raw_spoken_code_equivalence(
+        ref_text,
+        hyp_text,
+    )
+    early_raw_phrase_equivalence, hyp_pre_boundary_text = (
+        _raw_albeit_resegmentation_equivalence(ref_code_text, hyp_text)
+    )
+    if full_raw_equivalence:
+        # The complete spoken surfaces already agree.  Running a local raw
+        # boundary rewrite afterward can compare overlapping equal tokens and
+        # manufacture text (for example, C-I-C -> ci cic).
+        compact_boundary_equivalences = []
+        ref_boundary_text, hyp_boundary_text = ref_code_text, hyp_pre_boundary_text
+    else:
+        compact_boundary_equivalences, ref_boundary_text, hyp_boundary_text = (
+            _raw_compact_boundary_surface_equivalences(
+                ref_code_text, hyp_pre_boundary_text, phonetic_thr
+            )
+        )
+    time_two_to_equivalence, ref_time_text, hyp_time_text = (
+        _raw_time_two_to_equivalence(ref_boundary_text, hyp_boundary_text)
+    )
+    possessive_filler_equivalence, ref_possessive_filler_text, hyp_possessive_filler_text = (
+        _raw_lexical_possessive_filler_equivalence(ref_time_text, hyp_time_text)
+    )
+    apostrophe_s_equivalences, ref_apostrophe_s_text, hyp_apostrophe_s_text = (
         _raw_apostrophe_s_surface_equivalence(
             ref_possessive_filler_text,
             hyp_possessive_filler_text,
         )
     )
-    fusion_equivalence, ref_fusion_text, hyp_fusion_text = (
-        _raw_exact_surface_word_fusion_equivalence(
+    reduced_conjunction_equivalence, ref_conjunction_n_text = (
+        _raw_lowercase_n_conjunction_equivalence(
             ref_apostrophe_s_text,
+            hyp_apostrophe_s_text,
+        )
+    )
+    fusion_equivalence, ref_fusion_text, hyp_fusion_text = (
+        _raw_possessive_or_contraction_surface_fusion_equivalence(
+            ref_conjunction_n_text,
             hyp_apostrophe_s_text,
         )
     )
@@ -4476,8 +5536,14 @@ def compare_spoken(
             hyp_letter_sequence_text,
         )
     )
+    consonant_acronym_equivalence, ref_acronym_text, hyp_acronym_text = (
+        _raw_consonant_acronym_equivalence(
+            ref_acronym_render_text,
+            hyp_acronym_render_text,
+        )
+    )
     contraction_equivalence, ref_contraction_text, hyp_contraction_text = (
-        _raw_contraction_equivalence(ref_acronym_render_text, hyp_acronym_render_text)
+        _raw_contraction_equivalence(ref_acronym_text, hyp_acronym_text)
     )
     conjunction_equivalence, ref_conjunction_text, hyp_conjunction_text = (
         _raw_single_conjunction_omission_equivalence(
@@ -4485,6 +5551,13 @@ def compare_spoken(
             hyp_contraction_text,
         )
     )
+    late_raw_equivalence = _raw_normalized_equivalence(
+        ref_conjunction_text,
+        hyp_conjunction_text,
+        canon_lookup,
+    )
+    if late_raw_equivalence is not None:
+        hyp_conjunction_text = ref_conjunction_text
     book_term_tokens = set((book_term_evidence or {}).get("terms") or {})
     strict_ref_tokens = _strict_short_acronym_tokens(ref_text, book_term_evidence)
     ref_comparison_text = _strip_evidenced_book_term_possessives(
@@ -4494,13 +5567,12 @@ def compare_spoken(
     split_word_number_equivalence, ref_split_text, hyp_split_text = (
         _raw_split_word_number_equivalence(ref_comparison_text, hyp_conjunction_text)
     )
-    raw_phrase_equivalence, hyp_comparison_text = _raw_resegmented_phrase_equivalence(
+    raw_phrase_equivalence, hyp_comparison_text = _raw_albeit_resegmentation_equivalence(
         ref_split_text,
         hyp_split_text,
         strict_ref_tokens=strict_ref_tokens,
     )
     ref_comparison_text = ref_split_text
-    phonetic_thr = float(cfg.get("phonetic_match_threshold", 0.85))
     ref_norm, ref_ids = normalize(ref_comparison_text, canon_lookup)
     hyp_norm, hyp_ids = normalize(hyp_comparison_text, canon_lookup)
     stutter_equivalence, hyp_norm = _normalized_single_adjacent_stutter_equivalence(
@@ -4532,6 +5604,17 @@ def compare_spoken(
         alignment,
         strict_ref_tokens=strict_ref_tokens,
     )
+    boundary_resegmentation_equivalences = [
+        {
+            "kind": "boundary_resegmentation",
+            "expected": str(operation.get("ref") or ""),
+            "hypothesis": str(operation.get("hyp") or ""),
+            "direction": str(operation.get("direction") or ""),
+            "method": str(operation.get("boundary_method") or ""),
+        }
+        for operation in alignment["operations"]
+        if operation.get("op") == "boundary_resegmentation"
+    ]
     filtered_hyp = _render_aligned_hypothesis(alignment["operations"])
     # Count repeats on aligned tokens so hyphen splits of a book name are not
     # a new phrase; unmatched hyp words stay so extra copies still fail.
@@ -4540,7 +5623,7 @@ def compare_spoken(
         _aligned_repetition_tokens(alignment["operations"]),
         int(cfg.get("repeat_phrase_max_length", 6)),
     )
-    truncation = detect_truncation(ref_tokens, hyp_tokens)
+    truncation = detect_truncation(ref_tokens, hyp_tokens, alignment=alignment)
     accepted_list_label_equivalences = _accepted_list_label_equivalences(
         ref_text,
         hyp_text,
@@ -4602,6 +5685,7 @@ def compare_spoken(
         ref_text,
         hyp_text,
         canon_lookup,
+        alignment=alignment,
     )
 
     content_extra, extra_failure = _classify_extra_speech(
@@ -4733,15 +5817,22 @@ def compare_spoken(
         filtered_alignment["substitutions"] = []
         content_missing = []
         content_substitutions = []
-    accepted_equivalences = [
-        {"ref": str(op["ref"]), "hyp": str(op["hyp"])}
-        for op in alignment["operations"]
+    accepted_equivalences = []
+    for operation in alignment["operations"]:
         if (
-            op["op"] == "phonetic_equivalent"
-            and " " not in str(op.get("ref") or "")
-            and " " not in str(op.get("hyp") or "")
-        )
-    ]
+            operation["op"] != "phonetic_equivalent"
+            or " " in str(operation.get("ref") or "")
+            or " " in str(operation.get("hyp") or "")
+        ):
+            continue
+        equivalence = {
+            "ref": str(operation["ref"]),
+            "hyp": str(operation["hyp"]),
+        }
+        if operation.get("specialized_rule"):
+            equivalence["kind"] = str(operation["specialized_rule"])
+        accepted_equivalences.append(equivalence)
+    accepted_equivalences.extend(boundary_resegmentation_equivalences)
     if lone_content_soft is not None:
         accepted_equivalences.append(
             {
@@ -4786,16 +5877,27 @@ def compare_spoken(
     accepted_phrase_equivalences = [
         item
         for item in (
+            *terminal_diagnostic_equivalences,
+            pre_raw_equivalence,
+            slash_name_equivalence,
+            spoken_code_equivalence,
+            *compact_boundary_equivalences,
             possessive_filler_equivalence,
-            apostrophe_s_equivalence,
+            *apostrophe_s_equivalences,
+            reduced_conjunction_equivalence,
             fusion_equivalence,
             letter_sequence_equivalence,
             acronym_render_equivalence,
+            consonant_acronym_equivalence,
+            time_two_to_equivalence,
             contraction_equivalence,
             conjunction_equivalence,
+            late_raw_equivalence,
             split_word_number_equivalence,
+            early_raw_phrase_equivalence,
             raw_phrase_equivalence,
             stutter_equivalence,
+            *boundary_resegmentation_equivalences,
         )
         if item is not None
     ]
@@ -4908,6 +6010,7 @@ def compare_spoken(
         failure_type = failure_type or (
             "changed_negation" if "negation" in ctype
             else "changed_number" if "number" in ctype
+            else "changed_numeric_structure" if ctype == "numeric_structure"
             else "changed_identifier" if "identifier" in ctype
             else "missing_speech"
         )
@@ -4998,6 +6101,7 @@ def compare_spoken(
         )
 
     out: Dict[str, Any] = {
+        "comparison_policy_version": "boundary-resegmentation-v2",
         "passed": passed,
         "classification": classification,
         "failure_type": failure_type or "",

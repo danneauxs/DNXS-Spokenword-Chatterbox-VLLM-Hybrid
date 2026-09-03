@@ -367,10 +367,17 @@ class VllmBatchProcessor:
         return tokens_dict, chunks_data
 
     def shutdown(self):
-        """Release GPU resources."""
-        if hasattr(self, "model"):
-            self.model.shutdown()
+        """Release one Phase-1 model even after an earlier pipeline failure."""
+        model = getattr(self, "model", None)
+        try:
+            if model is not None:
+                model.shutdown()
+        finally:
+            # Make repeat cleanup safe for both normal phase transitions and errors.
             self.model = None
-        torch.cuda.empty_cache()
-        gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+            gc.collect()
         logger.info("VllmBatchProcessor shut down")

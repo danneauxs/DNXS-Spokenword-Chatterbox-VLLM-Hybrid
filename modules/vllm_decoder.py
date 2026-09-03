@@ -592,16 +592,18 @@ class VllmDecoder:
         return generated, skipped, local_scores
 
     def shutdown(self):
-        """Shuts down the model and releases resources."""
+        """Release selected S3Gen resources on success and decode exceptions."""
         model = self._model
-        if model is not None:
-            model.shutdown()
-        self._model = None
-        self._s3gen_ref = None
-        del model
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
-        gc.collect()
+        try:
+            if model is not None:
+                model.shutdown()
+        finally:
+            self._model = None
+            self._s3gen_ref = None
+            del model
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+            gc.collect()
         logger.info("Decoder shut down")

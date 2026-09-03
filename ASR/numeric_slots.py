@@ -24,10 +24,16 @@ _ORDINAL_WORDS = (
     "thousandth|millionth|billionth"
 )
 _NUMBER_WORD = rf"(?:{_CARDINAL_WORDS}|{_ORDINAL_WORDS})"
+# ``and`` is part of a cardinal expression only after a scale word (for
+# example, ``one hundred and five``).  A bare ``two and three`` is a list of
+# two independent numbers and must keep its conjunction visible to alignment.
+_SCALE_WORDS = r"(?:hundred|thousand|million|billion|trillion|hundredth|thousandth|millionth|billionth)"
+_SCALE_AND_SENTINEL = "__NUM_SCALE_AND__"
 _WORD_NUMBER = (
     rf"{_NUMBER_WORD}(?:(?:[\s-]+){_NUMBER_WORD}|"
-    rf"(?:\s+and\s+){_NUMBER_WORD})*"
+    rf"(?:\s+{_SCALE_AND_SENTINEL}\s+){_NUMBER_WORD})*"
 )
+_NUMBER_WORD_TOKEN_RE = re.compile(rf"^{_NUMBER_WORD}$", re.IGNORECASE)
 _WRITTEN_DIGIT_SEQUENCE_RE = re.compile(
     rf"\b{_DIGIT_WORDS}(?:(?:[\s-]+){_DIGIT_WORDS})+\b",
     re.IGNORECASE,
@@ -39,7 +45,7 @@ _WRITTEN_DIGIT_HUNDRED_TIME_RE = re.compile(
 _CURRENCY_WORD = r"(?:dollars?|pounds?|euros?|yen)"
 
 _WRITTEN_RANGE_RE = re.compile(
-    rf"\b{_WORD_NUMBER}(?:(?:\s+to\s+)|[-–—]){_WORD_NUMBER}\b",
+    rf"\b{_WORD_NUMBER}\s+to\s+{_WORD_NUMBER}\b",
     re.IGNORECASE,
 )
 _WRITTEN_CURRENCY_RE = re.compile(
@@ -55,6 +61,11 @@ _NUMERIC_TIME_RE = re.compile(r"(?<!\w)\d{1,2}:\d{2}(?!\w)")
 _NUMERIC_RANGE_RE = re.compile(
     r"(?<!\w)\d+(?:,\d{3})*(?:\.\d+)?\s*[-–—]\s*"
     r"\d+(?:,\d{3})*(?:\.\d+)?(?:[kKmMbB])?(?!\w)"
+)
+_NUMERIC_TO_RANGE_RE = re.compile(
+    r"(?<!\w)\d+(?:,\d{3})*(?:\.\d+)?(?:[kKmMbB])?\s+to\s+"
+    r"\d+(?:,\d{3})*(?:\.\d+)?(?:[kKmMbB])?(?!\w)",
+    re.IGNORECASE,
 )
 _NUMERIC_ORDINAL_RE = re.compile(r"(?<!\w)\d+(?:st|nd|rd|th)(?!\w)", re.IGNORECASE)
 _NUMERIC_DECADE_RE = re.compile(r"(?<!\w)\d{1,4}s(?!\w)", re.IGNORECASE)
@@ -144,6 +155,62 @@ _NUMBER_COMMA_SCALE_RE = re.compile(
 )
 
 
+def separate_numeric_compound_surfaces(text: str) -> str:
+    """Split numeric-led adjective compounds before typed-ID detection.
+
+    Numeric compounds such as ``16-year-old`` and ``twenty-one-year-old`` are
+    grammatical number expressions followed by ordinary words. Splitting only
+    at the boundary before the first non-number component preserves internal
+    number hyphens while preventing the complete surface from being classified
+    as an opaque mixed alphanumeric identifier.
+
+    Args:
+        text: Surface text before identifier and number classification.
+
+    Returns:
+        Text with numeric-to-prose hyphen boundaries converted to spaces.
+    """
+    if not text:
+        return ""
+
+    def split_token(match: re.Match) -> str:
+        """Split one hyphenated token only after its numeric components."""
+        token = match.group(0)
+        parts = re.split(r"[-–—]", token)
+        numeric_count = 0
+        for part in parts:
+            clean = part.strip(".,")
+            is_digit = bool(re.fullmatch(r"\d+(?:[.,]\d+)?(?:st|nd|rd|th)?", clean, re.IGNORECASE))
+            is_word = bool(_NUMBER_WORD_TOKEN_RE.fullmatch(clean))
+            if not (is_digit or is_word):
+                break
+            numeric_count += 1
+        if numeric_count == len(parts) or numeric_count == 0:
+            return token
+        numeric_surface = "-".join(parts[:numeric_count])
+        prose_surface = " ".join(parts[numeric_count:])
+        return f"{numeric_surface} {prose_surface}"
+
+    # Candidate must begin with a number word/digit and contain a hyphen. The
+    # callback performs the stricter component-level test above.
+    return re.sub(
+        rf"(?<!\w)(?:\d+(?:[.,]\d+)?(?:st|nd|rd|th)?|{_NUMBER_WORD})(?:[-–—][A-Za-z0-9]+)+",
+        split_token,
+        text,
+        flags=re.IGNORECASE,
+    )
+
+
+def _protect_scale_conjunctions(text: str) -> str:
+    """Mark scale conjunctions so list conjunctions remain separate tokens."""
+    return re.sub(
+        rf"\b({_SCALE_WORDS})\s+and\s+(?={_NUMBER_WORD}\b)",
+        rf"\1 {_SCALE_AND_SENTINEL} ",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+
 def replace_spoken_number_spans(text: str) -> str:
     """Replace every written or numeral number expression with one opaque slot.
 
@@ -159,9 +226,18 @@ def replace_spoken_number_spans(text: str) -> str:
 
     # Replace compound forms before their component numerals so every spoken
     # value receives one positional slot rather than several partial slots.
-    normalized = text.lower()
+    normalized = _protect_scale_conjunctions(text.lower())
     # Fuse ``sixty, thousand`` → ``sixty thousand`` before slotting.
     normalized = _NUMBER_COMMA_SCALE_RE.sub(r"\1 \2", normalized)
+    # Preserve range structure. Written and numeric ``to`` forms each expose
+    # two numeric operands, while numeric hyphen ranges retain their existing
+    # compact single-slot behavior for identifier-like surfaces.
+    normalized = _WRITTEN_RANGE_RE.sub(
+        f"{NUMERIC_SLOT} to {NUMERIC_SLOT}", normalized
+    )
+    normalized = _NUMERIC_TO_RANGE_RE.sub(
+        f"{NUMERIC_SLOT} to {NUMERIC_SLOT}", normalized
+    )
     for pattern in (
         _NUMERIC_CURRENCY_RE,
         _NUMERIC_TIME_RE,
@@ -170,7 +246,6 @@ def replace_spoken_number_spans(text: str) -> str:
         _WRITTEN_CURRENCY_RE,
         _WRITTEN_DASH_PERCENT_RE,
         _WRITTEN_PERCENT_RE,
-        _WRITTEN_RANGE_RE,
         _WRITTEN_DIGIT_HUNDRED_TIME_RE,
         _WRITTEN_DIGIT_SEQUENCE_RE,
         _DIGIT_SCALE_RE,

@@ -1230,12 +1230,8 @@ class ChatterboxMainWindow(QMainWindow):
         self.t3_source_combo.addItem("Standard (English T3)", "english")
         self.t3_source_combo.addItem("Multilingual V2", "multilingual-v2")
         self.t3_source_combo.addItem("Multilingual V3", "multilingual-v3")
-        try:
-            current_t3 = resolve_t3_source()
-        except Exception:
-            current_t3 = "multilingual-v3"
-        if current_t3 == "turbo":
-            current_t3 = "multilingual-v3"
+        # Keep GUI's first-launch choice compatible with standard English T3.
+        current_t3 = "english"
         idx = self.t3_source_combo.findData(current_t3)
         if idx >= 0:
             self.t3_source_combo.setCurrentIndex(idx)

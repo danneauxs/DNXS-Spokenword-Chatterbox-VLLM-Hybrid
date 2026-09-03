@@ -3644,16 +3644,19 @@ def process_book_folder(
             variant=t3_variant,
             language_id=t3_language,
         )
-        tokens_dict, chunks_data = batch_processor.process_chunks(
-            json_path=json_path,
-            cond_emb=cond_emb,
-            progress_callback=phase1_progress,
-        )
-        phase1_end_time = time.time()
-        log_vram_checkpoint("before vLLM shutdown")
-        batch_processor.shutdown()
-        batch_processor = None
-        gc.collect()
+        try:
+            tokens_dict, chunks_data = batch_processor.process_chunks(
+                json_path=json_path,
+                cond_emb=cond_emb,
+                progress_callback=phase1_progress,
+            )
+            phase1_end_time = time.time()
+            log_vram_checkpoint("before vLLM shutdown")
+        finally:
+            # Free T3 before any selected S3Gen model can claim the GPU.
+            batch_processor.shutdown()
+            batch_processor = None
+            gc.collect()
         log_vram_checkpoint("after vLLM shutdown, before selected S3Gen")
         chunk_meta = _build_chunk_meta(chunks_data)
 
@@ -3673,29 +3676,34 @@ def process_book_folder(
         if asr_enabled_resolved:
             print("[ASR] Stage 1 is scheduled after S3Gen shutdown; no ASR daemon starts during decode")
 
-        decoder = VllmDecoder(
-            decoder_type=s3gen_decoder,
-            ckpt_dir=ckpt_dir,
-            target_device=device,
-            voice_path=compatible_voice,
-            turbo_ckpt_dir=getattr(_cfg, "TURBO_CKPT_DIR", None),
-        )
-        generated, skipped, local_scores = decoder.decode_tokens(
-            tokens_dict=tokens_dict,
-            audio_output_dir=audio_chunks_dir,
-            chunk_meta=chunk_meta,
-            progress_callback=phase2_progress,
-            asr_client=None,
-            asr_threshold=asr_threshold,
-            enable_quality_scoring=False,
-        )
-        # Captured HERE, before decoder.shutdown()/Phase 3's ASR wait -- not after --
-        # so the "Elapsed Time"/"Realtime RAW" stat below reflects pure generation
-        # time, not however long Phase 3 took to collect ASR results.
-        phase2_end_time = time.time()
-        decoder.shutdown()
         decoder = None
-        gc.collect()
+        try:
+            decoder = VllmDecoder(
+                decoder_type=s3gen_decoder,
+                ckpt_dir=ckpt_dir,
+                target_device=device,
+                voice_path=compatible_voice,
+                turbo_ckpt_dir=getattr(_cfg, "TURBO_CKPT_DIR", None),
+            )
+            generated, skipped, local_scores = decoder.decode_tokens(
+                tokens_dict=tokens_dict,
+                audio_output_dir=audio_chunks_dir,
+                chunk_meta=chunk_meta,
+                progress_callback=phase2_progress,
+                asr_client=None,
+                asr_threshold=asr_threshold,
+                enable_quality_scoring=False,
+            )
+            # Captured HERE, before decoder cleanup/Phase 3's ASR wait -- not after --
+            # so the "Elapsed Time"/"Realtime RAW" stat below reflects pure generation
+            # time, not however long Phase 3 took to collect ASR results.
+            phase2_end_time = time.time()
+        finally:
+            # ASR starts only after this decoder has fully released S3Gen VRAM.
+            if decoder is not None:
+                decoder.shutdown()
+                decoder = None
+            gc.collect()
         log_vram_checkpoint("after selected S3Gen shutdown, before Stage 1")
 
         logging.info("=" * 70)
@@ -3796,16 +3804,19 @@ def process_book_folder(
             variant=t3_variant,
             language_id=t3_language,
         )
-        tokens_dict, chunks_data = batch_processor.process_chunks(
-            json_path=json_path,
-            cond_emb=cond_emb,
-            progress_callback=phase1_progress,
-        )
-        phase1_end_time = time.time()
-        log_vram_checkpoint("before vLLM shutdown")
-        batch_processor.shutdown()
-        batch_processor = None
-        gc.collect()
+        try:
+            tokens_dict, chunks_data = batch_processor.process_chunks(
+                json_path=json_path,
+                cond_emb=cond_emb,
+                progress_callback=phase1_progress,
+            )
+            phase1_end_time = time.time()
+            log_vram_checkpoint("before vLLM shutdown")
+        finally:
+            # Turbo-Hybrid must also release T3 before selected S3Gen loads.
+            batch_processor.shutdown()
+            batch_processor = None
+            gc.collect()
         log_vram_checkpoint("after vLLM shutdown, before selected S3Gen")
         chunk_meta = _build_chunk_meta(chunks_data)
 
@@ -3821,6 +3832,7 @@ def process_book_folder(
         if asr_enabled_resolved:
             print("[ASR] Stage 1 is scheduled after S3Gen shutdown; no ASR daemon starts during decode")
 
+        decoder = None
         try:
             def audio_progress(current, total, message):
                 """Report selected-S3Gen Phase 2 progress to the GUI status panel."""
@@ -3853,11 +3865,6 @@ def process_book_folder(
             # so the "Elapsed Time"/"Realtime RAW" stat below reflects pure generation
             # time, not however long Phase 3 took to collect ASR results.
             phase2_end_time = time.time()
-            decoder.shutdown()
-            decoder = None
-            gc.collect()
-            log_vram_checkpoint("after selected S3Gen shutdown, before Stage 1")
-
             logging.info(
                 f"Phase 2 complete: {generated} chunks generated, {skipped} skipped"
             )
@@ -3867,6 +3874,13 @@ def process_book_folder(
             raise RuntimeError(
                 f"Turbo-Hybrid Phase 2 audio generation failed: {e}"
             ) from e
+        finally:
+            # Release Turbo/Standard S3Gen before Phase 3's isolated ASR child.
+            if decoder is not None:
+                decoder.shutdown()
+                decoder = None
+            gc.collect()
+        log_vram_checkpoint("after selected S3Gen shutdown, before Stage 1")
 
         asr_summary = _run_phase3_regen(
             chunk_meta=chunk_meta,

@@ -1026,41 +1026,40 @@ class ChatterboxTTS:
         t3 = getattr(self, "t3", None)
         llm_engine = getattr(t3, "llm_engine", None)
         engine_core = getattr(llm_engine, "engine_core", None)
-        if engine_core is not None:
-            engine_core.shutdown()
-
+        try:
+            if engine_core is not None:
+                engine_core.shutdown()
+        finally:
             # EngineCore retains the executor, and the executor retains the
-            # worker/model/KV cache. Break this ownership chain explicitly.
-            engine_core.model_executor = None
+            # worker/model/KV cache. Break this ownership chain even when its
+            # nominal shutdown raises, so later ASR does not inherit T3 VRAM.
+            if engine_core is not None:
+                engine_core.model_executor = None
+            if llm_engine is not None:
+                llm_engine.engine_core = None
+                llm_engine.model_executor = None
 
-        if llm_engine is not None:
-            llm_engine.engine_core = None
-            llm_engine.model_executor = None
-
-        del t3
-        del engine_core
-        del llm_engine
-        # T3CondEnc and the two speech embeddings are Phase-1 CUDA modules.
-        # They are not owned by vLLM's executor, so executor shutdown cannot
-        # release them.  Leaving these attributes alive retained about 3 GB
-        # after English T3 runs and prevented Parakeet from loading.
-        for attr in (
-            't3',
-            't3_config',
-            't3_cond_enc',
-            't3_speech_emb',
-            't3_speech_pos_emb',
-            's3gen',
-            've',
-            'default_conds',
-        ):
-            if hasattr(self, attr):
-                delattr(self, attr)
-        # The cached method can retain voice conditional GPU tensors when this
-        # class was used outside T3-only Phase 1.
-        self.get_audio_conditionals.cache_clear()
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
+            # T3CondEnc and the two speech embeddings are Phase-1 CUDA modules.
+            # They are not owned by vLLM's executor, so executor shutdown cannot
+            # release them.  Leaving these attributes alive retained about 3 GB
+            # after English T3 runs and prevented Parakeet from loading.
+            for attr in (
+                't3',
+                't3_config',
+                't3_cond_enc',
+                't3_speech_emb',
+                't3_speech_pos_emb',
+                's3gen',
+                've',
+                'default_conds',
+            ):
+                if hasattr(self, attr):
+                    delattr(self, attr)
+            # The cached method can retain voice conditional GPU tensors when this
+            # class was used outside T3-only Phase 1.
+            self.get_audio_conditionals.cache_clear()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()

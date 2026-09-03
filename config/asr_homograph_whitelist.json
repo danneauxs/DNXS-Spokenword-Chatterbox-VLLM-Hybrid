@@ -1,0 +1,33 @@
+{
+  "description": "Exact ASR homograph and pronunciation respellings. Forms are compared only as listed; numeric, identifier, acronym, and negation spans remain protected.",
+  "homograph_whitelist": [
+    {"canonical": "recreation", "equivalents": ["re kreation", "wreckre ation"]},
+    {"canonical": "bowed", "equivalents": ["boed", "boughed"]},
+    {"canonical": "Jesus", "equivalents": ["heysous"]},
+    {"canonical": "lead", "equivalents": ["leed", "led"]},
+    {"canonical": "read", "equivalents": ["reed", "red"]},
+    {"canonical": "wound", "equivalents": ["woond", "wow'nd"]},
+    {"canonical": "live", "equivalents": ["liv", "lyve"]},
+    {"canonical": "object", "equivalents": ["objekt", "ub ject"]},
+    {"canonical": "close", "equivalents": ["cloze"]},
+    {"canonical": "record", "equivalents": ["rec urd", "re cord"]},
+    {"canonical": "records", "equivalents": ["rec urds", "re cords"]},
+    {"canonical": "present", "equivalents": ["prezent"]},
+    {"canonical": "sow", "equivalents": ["soh"]},
+    {"canonical": "row", "equivalents": ["ro", "rau"]},
+    {"canonical": "bass", "equivalents": ["base", "bas"]},
+    {"canonical": "resume", "equivalents": ["rezoom"]},
+    {"canonical": "tear", "equivalents": ["tair", "teer"]},
+    {"canonical": "refuse", "equivalents": ["refuze"]},
+    {"canonical": "polish", "equivalents": ["pole ish", "pollish"]},
+    {"canonical": "invalid", "equivalents": ["in valid", "inva lid"]},
+    {"canonical": "elaborate", "equivalents": ["elaborayt", "elaborit"]},
+    {"canonical": "estimate", "equivalents": ["estim 8", "estimit"]},
+    {"canonical": "wind", "equivalents": ["whined"]},
+    {"canonical": "buffet", "equivalents": ["buffay", "buff et"]},
+    {"canonical": "crooked", "equivalents": ["krooked"]},
+    {"canonical": "dogged", "equivalents": ["dog ed", "dog'd"]},
+    {"canonical": "intimate", "equivalents": ["intamayt", "inta mit"]},
+    {"canonical": "minute", "equivalents": ["mynoot", "minit"]}
+  ]
+}

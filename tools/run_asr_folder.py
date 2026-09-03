@@ -137,6 +137,26 @@ def _is_scored(row: Dict[str, Any]) -> bool:
     return bool(row) and "score" in row and not row.get("error")
 
 
+def _unscored_error_summary(rows: Iterable[Dict[str, Any]]) -> str:
+    """Return one compact representative error when an ASR stage cannot score.
+
+    The batch runner intentionally returns an operational-error row for every
+    task rather than calling an engine setup failure an audio failure.  This
+    summary makes that distinction visible to standalone callers before they
+    decide whether to preserve a prior confirmed-failure report.
+    """
+    errors = {
+        str(row.get("error") or "ASR returned no scored result").strip()
+        for row in rows
+        if not _is_scored(row)
+    }
+    if not errors:
+        return ""
+    first = sorted(errors)[0]
+    suffix = f" (+{len(errors) - 1} distinct error(s))" if len(errors) > 1 else ""
+    return first + suffix
+
+
 def _confirmed_failures(
     rows: Iterable[Dict[str, Any]],
     known_passes: Dict[Tuple[int, str], str],
@@ -244,6 +264,33 @@ def run_folder(
     _write_json(tts_dir / "asr_stage1_failures.json", stage1_failures)
     _write_report(tts_dir / "asr_stage1_report.txt", "ASR Stage 1 inspection", stage1_rows, threshold)
 
+    if stage1_unscored == len(stage1_rows):
+        error_summary = _unscored_error_summary(stage1_rows)
+        summary = {
+            "tts_dir": str(tts_dir),
+            "threshold": threshold,
+            "success": False,
+            "stage1": stage1_meta,
+            "stage1_failures": 0,
+            "stage1_unscored": stage1_unscored,
+            "stage1_error": error_summary,
+            "stage2": {
+                "backend": stage2_backend,
+                "model": stage2_model,
+                "chunks": 0,
+                "skipped": True,
+                "reason": "Stage 1 produced no scored rows",
+            },
+            "completed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        }
+        _write_json(tts_dir / "asr_run_summary.json", summary)
+        print(
+            "[ASR-only] ERROR: Stage 1 produced no scored rows. "
+            "Stage 2 was not run and the prior asr_confirmed_failures.json was preserved."
+        )
+        print(f"[ASR-only] Stage 1 error: {error_summary}")
+        return summary
+
     stage2_rows: List[Dict[str, Any]] = []
     stage2_failures: List[Dict[str, Any]] = []
     stage2_meta: Dict[str, Any] = {"backend": stage2_backend, "model": stage2_model, "chunks": 0, "skipped": True}
@@ -274,6 +321,7 @@ def run_folder(
     summary = {
         "tts_dir": str(tts_dir),
         "threshold": threshold,
+        "success": True,
         "stage1": stage1_meta,
         "stage1_failures": len(stage1_failures),
         "stage1_unscored": stage1_unscored,
@@ -307,7 +355,7 @@ def main(argv: List[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
     args = _build_parser().parse_args(argv)
     try:
-        run_folder(
+        summary = run_folder(
             args.folder,
             args.stage1_backend,
             args.stage1_model,
@@ -316,6 +364,8 @@ def main(argv: List[str] | None = None) -> int:
             args.device,
             args.threshold,
         )
+        if not summary.get("success", True):
+            return 2
     except Exception as exc:
         logger.exception("ASR-only run failed: %s", exc)
         return 1
